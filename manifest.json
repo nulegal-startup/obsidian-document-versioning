@@ -1,7 +1,7 @@
 {
 	"id": "github-sync",
 	"name": "GitHub Sync",
-	"version": "1.8.2",
+	"version": "1.9.0",
 	"minAppVersion": "0.15.0",
 	"description": "Sync an Obsidian vault through safe, branch-based documentation changes.",
 	"author": "NuLegal",

@@ -1187,6 +1187,46 @@
   text-wrap: pretty;
 }
 
+.suggestion-item.gh-sync-document-mention {
+  align-items: center;
+  display: flex;
+  gap: 9px;
+  min-height: 40px;
+}
+
+.gh-sync-document-mention__avatar {
+  align-items: center;
+  background: var(--interactive-accent);
+  border-radius: 50%;
+  color: var(--text-on-accent);
+  display: inline-flex;
+  flex: 0 0 28px;
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--font-semibold);
+  height: 28px;
+  justify-content: center;
+  text-transform: uppercase;
+}
+
+.gh-sync-document-mention__copy {
+  min-width: 0;
+}
+
+.gh-sync-document-mention__name {
+  color: var(--text-normal);
+  font-size: var(--font-ui-small);
+  font-weight: var(--font-medium);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gh-sync-document-mention__detail {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  margin-top: 1px;
+}
+
 .gh-sync-review-modal__people {
   align-items: center;
   color: var(--text-muted);

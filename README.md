@@ -27,6 +27,7 @@ This fork adds a non-technical, branch-based documentation workflow to Kevin Chi
 - Create or reuse a draft GitHub pull request when a change branch is published.
 - Show a visible **Comment** control beside selected text and attach the discussion without changing the Markdown document.
 - Autocomplete repository collaborators as the author types `@`, plus replies, resolve/reopen, and a workspace Review Center.
+- Autocomplete the same GitHub collaborators when an editor types `@` directly in a Markdown document.
 - Prevent overlapping manual, startup, and scheduled Git operations.
 - Reject credential-bearing remote URLs and redact common GitHub tokens from errors.
 
@@ -77,6 +78,8 @@ Do not embed a GitHub token in the remote URL. Use SSH or Git Credential Manager
 Select text in a Markdown note and use the editor context menu or command palette action **Comment on selected text**. The plugin records a deterministic text anchor (file, line range, selected text, and bounded surrounding context) in hidden metadata on the branch's draft pull request. The Markdown file itself remains unchanged.
 
 The **Documentation review** side panel groups replies into threads and lets editors navigate back to the note, reply, resolve, or reopen a discussion. `@mentions` use GitHub identities and normal GitHub notifications. If the selected wording moves, the bounded context lets the plugin re-identify it; if it is deleted, the thread remains available in the Review Center as historical discussion.
+
+Typing `@` directly in a Markdown document also opens the collaborator picker and inserts the chosen `@username` into the file. This is durable document content and is versioned with Git. GitHub only sends mention notifications from the pull-request discussion; a username written inside a repository file is intentionally not posted or notified automatically.
 
 Review comments require a GitHub account with repository access and an authenticated GitHub CLI. The plugin never stores a GitHub token. Failure to create or refresh a review does not block Git commits, pulls, or pushes.
 

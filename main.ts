@@ -19,6 +19,7 @@ import { createTextAnchor, reanchorText, TextAnchor } from './review-anchor';
 import { GitHubRepository, GitHubReviewClient, GitHubReviewComment, PullRequestInfo, parseGitHubRepository } from './github-review';
 import { reviewEditorExtension } from './review-editor';
 import { applyMention, matchingMentions, mentionQueryAt, MentionQuery } from './review-mention';
+import { DocumentMentionSuggest } from './document-mention';
 
 type NoticeLevelSetting = 'ALL' | 'WARNING' | 'ERROR';
 type LegacyNoticeLevelSetting = NoticeLevelSetting | 'WARNINGS';
@@ -196,6 +197,8 @@ export default class GHSyncPlugin extends Plugin {
 	private dirtyRefreshTimer?: number;
 	private readonly gitControlEls: HTMLElement[] = [];
 	private reviewSnapshot?: ReviewSnapshot;
+	private collaboratorCache?: { users: string[]; expiresAt: number };
+	private collaboratorRequest?: Promise<string[]>;
 
 	private shouldShowNotice(severity: NoticeSeverity): boolean {
 		switch (this.settings.noticeLevel) {
@@ -263,6 +266,28 @@ export default class GHSyncPlugin extends Plugin {
 			this.showNotice(`Branch synced, but review setup needs attention: ${redactSensitiveText(error)}`, 'WARNING', 12000);
 			return undefined;
 		}
+	}
+
+	async getDocumentMentionUsers(): Promise<string[]> {
+		if (this.collaboratorCache && this.collaboratorCache.expiresAt > Date.now()) {
+			return this.collaboratorCache.users;
+		}
+		if (this.collaboratorRequest) return this.collaboratorRequest;
+		this.collaboratorRequest = (async () => {
+			try {
+				const repository = parseGitHubRepository(this.settings.remoteURL);
+				const client = this.getReviewClient();
+				await client.assertAuthenticated();
+				const users = await client.listCollaborators(repository);
+				this.collaboratorCache = { users, expiresAt: Date.now() + 5 * 60 * 1000 };
+				return users;
+			} catch {
+				return [];
+			} finally {
+				this.collaboratorRequest = undefined;
+			}
+		})();
+		return this.collaboratorRequest;
 	}
 
 	private getBaseBranch(): string {
@@ -970,6 +995,9 @@ export default class GHSyncPlugin extends Plugin {
 		}));
 		this.registerEditorExtension(reviewEditorExtension({
 			commentOnSelection: () => void this.commentOnSelection(),
+		}));
+		this.registerEditorSuggest(new DocumentMentionSuggest(this.app, {
+			getUsers: () => this.getDocumentMentionUsers(),
 		}));
 		this.branchStatusEl = this.addStatusBarItem();
 		this.branchStatusEl.addClass('gh-sync-status');
