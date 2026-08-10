@@ -38,3 +38,21 @@ test('redacts common GitHub tokens and URL passwords', () => {
 	assert.equal(redacted.includes('secret'), false);
 	assert.equal(redacted.includes('ghp_'), false);
 });
+
+test('describes every deterministic branch synchronization state', () => {
+	assert.deepEqual(helpers.describeBranchSync(0, 0, true), {
+		state: 'up-to-date', label: 'Up to date', compact: '✓',
+	});
+	assert.deepEqual(helpers.describeBranchSync(0, 3, true), {
+		state: 'behind', label: '3 behind', compact: '↓3',
+	});
+	assert.deepEqual(helpers.describeBranchSync(2, 0, true), {
+		state: 'ahead', label: '2 ahead', compact: '↑2',
+	});
+	assert.deepEqual(helpers.describeBranchSync(2, 3, true), {
+		state: 'diverged', label: '2 ahead · 3 behind', compact: '↑2 ↓3',
+	});
+	assert.deepEqual(helpers.describeBranchSync(0, 0, false), {
+		state: 'unpublished', label: 'Not published', compact: 'Local only',
+	});
+});
