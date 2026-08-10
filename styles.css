@@ -1,42 +1,226 @@
-/*
-
-This CSS file will be included with your plugin, and
-available in the app when your plugin is enabled.
-
-If your plugin does not need CSS, delete this file.
-
-*/
-
-
-.gh-sync-ribbon
-{
-    order: 100;
+.gh-sync-ribbon {
+  order: 100;
 }
 
-.gh-sync-status
-{
-    order: -1;
+.gh-sync-ribbon,
+.gh-sync-branch-ribbon {
+  transition-property: color, background-color, opacity, transform;
+  transition-duration: 150ms;
+  transition-timing-function: ease-out;
+}
+
+.gh-sync-ribbon:active,
+.gh-sync-branch-ribbon:active {
+  transform: scale(0.96);
+}
+
+.gh-sync-ribbon.is-busy,
+.gh-sync-branch-ribbon.is-busy {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.gh-sync-status {
+  order: -1;
+  align-items: center;
+  display: inline-flex;
+  gap: 5px;
+  max-width: min(360px, 40vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition-property: color, background-color;
+  transition-duration: 150ms;
+  transition-timing-function: ease-out;
+}
+
+.gh-sync-status[aria-busy="true"] {
+  color: var(--text-accent);
+  cursor: progress;
+  font-variant-numeric: tabular-nums;
+}
+
+.gh-sync-status__spinner,
+.gh-sync-operation__spinner {
+  animation: gh-sync-spin 900ms linear infinite;
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
+.gh-sync-status__spinner svg {
+  height: 13px;
+  width: 13px;
+}
+
+.notice.gh-sync-operation {
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 12px;
+  box-shadow: 0 12px 32px rgb(0 0 0 / 18%), 0 2px 8px rgb(0 0 0 / 10%);
+  color: var(--text-normal);
+  max-width: min(420px, calc(100vw - 32px));
+  overflow: hidden;
+  padding: 14px;
+  width: 360px;
+}
+
+.gh-sync-operation__header {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+}
+
+.gh-sync-operation__icon {
+  align-items: center;
+  color: var(--interactive-accent);
+  display: inline-flex;
+  flex: 0 0 auto;
+  justify-content: center;
+}
+
+.gh-sync-operation__icon svg {
+  height: 19px;
+  width: 19px;
+}
+
+.gh-sync-operation__title {
+  font-size: var(--font-ui-medium);
+  font-weight: var(--font-semibold);
+  line-height: 1.3;
+  text-wrap: balance;
+}
+
+.gh-sync-operation__steps {
+  border-left: 1px solid var(--background-modifier-border);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin: 12px 0 11px 9px;
+  padding-left: 14px;
+}
+
+.gh-sync-operation__step {
+  align-items: flex-start;
+  color: var(--text-faint);
+  display: flex;
+  font-size: var(--font-ui-small);
+  gap: 8px;
+  line-height: 1.35;
+  min-height: 18px;
+  opacity: 0.72;
+  transform: translateY(0);
+  transition-property: color, opacity, transform;
+  transition-duration: 150ms;
+  transition-timing-function: ease-out;
+}
+
+.gh-sync-operation__step.is-active {
+  color: var(--text-normal);
+  font-weight: var(--font-medium);
+  opacity: 1;
+}
+
+.gh-sync-operation__step.is-complete {
+  color: var(--text-muted);
+  opacity: 0.82;
+}
+
+.gh-sync-operation__step.is-error {
+  color: var(--text-error);
+  opacity: 1;
+}
+
+.gh-sync-operation__step-icon {
+  align-items: center;
+  background: var(--background-primary);
+  display: inline-flex;
+  flex: 0 0 auto;
+  justify-content: center;
+  margin-left: -21px;
+  margin-top: 1px;
+}
+
+.gh-sync-operation__step-icon svg {
+  height: 12px;
+  width: 12px;
+}
+
+.gh-sync-operation__step.is-active .gh-sync-operation__step-icon {
+  color: var(--interactive-accent);
+}
+
+.gh-sync-operation__step.is-complete .gh-sync-operation__step-icon {
+  color: var(--color-green);
+}
+
+.gh-sync-operation__hint {
+  border-top: 1px solid var(--background-modifier-border);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.45;
+  padding-top: 10px;
+  text-wrap: pretty;
+}
+
+.notice.gh-sync-operation.is-success .gh-sync-operation__icon {
+  color: var(--color-green);
+}
+
+.notice.gh-sync-operation.is-warning .gh-sync-operation__icon {
+  color: var(--color-orange);
+}
+
+.notice.gh-sync-operation.is-error .gh-sync-operation__icon,
+.notice.gh-sync-operation.is-error .gh-sync-operation__hint {
+  color: var(--text-error);
 }
 
 .howto {
+  background: var(--background-secondary);
   border: 1px solid var(--background-modifier-border);
-  padding: 10px;
+  border-radius: 10px;
+  padding: 12px;
 }
 
 .howto_title {
-  font-weight: 600;
+  font-weight: var(--font-semibold);
+  text-wrap: balance;
 }
 
 .howto_text {
   color: var(--text-muted);
-  font-size: smaller;
+  display: block;
+  font-size: var(--font-ui-smaller);
+  line-height: 1.45;
+  margin-top: 4px;
+  text-wrap: pretty;
 }
 
-.my-plugin-setting-text {
-    width: 30em;
-}
-
+.my-plugin-setting-text,
 .my-plugin-setting-text2 {
-    width: 30em;
+  width: 30em;
 }
 
+@keyframes gh-sync-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .gh-sync-status__spinner,
+  .gh-sync-operation__spinner {
+    animation-duration: 1800ms;
+  }
+
+  .gh-sync-ribbon,
+  .gh-sync-branch-ribbon,
+  .gh-sync-operation__step {
+    transition-duration: 0ms;
+  }
+
+  .gh-sync-ribbon:active,
+  .gh-sync-branch-ribbon:active {
+    transform: none;
+  }
+}

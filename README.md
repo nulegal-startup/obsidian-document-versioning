@@ -12,6 +12,9 @@ This fork adds a non-technical, branch-based documentation workflow to Kevin Chi
 - Open a branch manager from the status bar or branch ribbon icon.
 - Display, switch, and synchronize the explicitly selected current branch.
 - Carry edits accidentally made on `main` into a new change branch before committing them.
+- Show a live operation timeline while Git is checking, fetching, merging, switching, or pushing.
+- Mirror the current operation in the status bar and temporarily disable conflicting ribbon actions.
+- Keep errors and action-needed states visible long enough to understand what happened.
 - Refuse to switch branches when local or remote work is not synchronized.
 - Stop on merge conflicts and open each conflicting note for resolution.
 - Prevent overlapping manual, startup, and scheduled Git operations.
@@ -29,6 +32,8 @@ This fork adds a non-technical, branch-based documentation workflow to Kevin Chi
 The branch manager also lists existing local and GitHub branches. Switching is allowed only when the current branch is clean and synchronized, preventing uncommitted edits from being silently carried between changes.
 
 If files were edited while still on protected `main`, clicking Sync does not commit them to `main`. It opens the branch manager; **Start change** creates the new branch and commits those edits there.
+
+Git operations run in the background with a non-blocking activity card. Completed stages receive check marks, the active stage appears in both the card and status bar, and the final state clearly reports success, required action, or failure. The progress is stage-based because Git does not expose a reliable percentage for every operation.
 
 The default accepted branch is `main`, and the default change prefix is `changes`.
 
