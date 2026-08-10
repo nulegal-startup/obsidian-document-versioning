@@ -14,6 +14,7 @@ interface GHSyncSettings {
 	gitLocation: string;
 	baseBranch: string;
 	branchPrefix: string;
+	protectBaseBranch: boolean;
 	syncinterval: number;
 	isSyncOnLoad: boolean;
 	checkStatusOnLoad: boolean;
@@ -26,12 +27,19 @@ const DEFAULT_SETTINGS: GHSyncSettings = {
 	gitLocation: '',
 	baseBranch: 'main',
 	branchPrefix: 'changes',
+	protectBaseBranch: true,
 	syncinterval: 0,
 	isSyncOnLoad: false,
 	checkStatusOnLoad: true,
 	noticeLevel: 'ALL',
 	showSyncSuccessNotice: true,
 };
+
+interface BranchSnapshot {
+	current: string;
+	base: string;
+	branches: string[];
+}
 
 export default class GHSyncPlugin extends Plugin {
 	settings: GHSyncSettings;
@@ -120,6 +128,23 @@ export default class GHSyncPlugin extends Plugin {
 		}
 	}
 
+	async getBranchSnapshot(): Promise<BranchSnapshot> {
+		const git = this.getGit();
+		await this.configureRemote(git);
+		await git.fetch('origin');
+		const current = await this.currentBranch(git);
+		const allBranches = await git.branch(['-a']);
+		const branches = Array.from(new Set(allBranches.all
+			.map((branch) => branch.replace(/^remotes\/origin\//, '').replace(/^origin\//, ''))
+			.filter((branch) => branch !== 'HEAD' && isSafeBranchRef(branch))))
+			.sort((left, right) => left.localeCompare(right));
+		return { current, base: this.getBaseBranch(), branches };
+	}
+
+	openBranchManager(): void {
+		new BranchManagerModal(this.app, this).open();
+	}
+
 	private async updateBranchStatus(git?: SimpleGit): Promise<void> {
 		if (!this.branchStatusEl) return;
 		try {
@@ -173,14 +198,20 @@ export default class GHSyncPlugin extends Plugin {
 		}
 	}
 
-	async syncNotes(): Promise<void> {
+	async syncNotes(showBranchManagerOnProtected = true): Promise<void> {
 		await this.withGitLock(async () => {
 			try {
 				const git = this.getGit();
 				await git.status();
 				await this.configureRemote(git);
+				const status = await git.status();
 				const branch = await this.currentBranch(git);
-				await this.commitLocalChanges(git);
+				if (this.settings.protectBaseBranch && branch === this.getBaseBranch() && !status.isClean()) {
+					this.showNotice(`${branch} is protected. Start or switch to a change branch before syncing edited files.`, 'WARNING', 10000);
+					if (showBranchManagerOnProtected) this.openBranchManager();
+					return;
+				}
+				await this.commitLocalChanges(git, status);
 				await git.fetch('origin');
 
 				if (await this.remoteBranchExists(git, branch)) {
@@ -208,14 +239,9 @@ export default class GHSyncPlugin extends Plugin {
 			try {
 				const git = this.getGit();
 				const status = await git.status();
-				if (!status.isClean()) {
-					throw new Error('Sync or commit your current changes before starting a new change.');
-				}
-
 				await this.configureRemote(git);
 				await git.fetch('origin');
 				const currentBranch = await this.currentBranch(git);
-				await this.requireSynchronizedBranch(git, currentBranch);
 				const baseBranch = this.getBaseBranch();
 				const newBranch = normalizeBranchName(changeTitle, this.settings.branchPrefix);
 				const localBranches = await git.branchLocal();
@@ -223,11 +249,32 @@ export default class GHSyncPlugin extends Plugin {
 					throw new Error(`The branch ${newBranch} already exists. Choose another change name.`);
 				}
 
-				await git.checkout(baseBranch);
-				if (await this.remoteBranchExists(git, baseBranch)) {
-					await git.pull('origin', baseBranch, { '--ff-only': null });
+				if (!status.isClean()) {
+					if (currentBranch !== baseBranch) {
+						throw new Error(`Sync the edits on ${currentBranch} before starting another change.`);
+					}
+					if (status.conflicted.length > 0) {
+						throw new Error('Resolve the existing merge conflicts before starting a change.');
+					}
+					await git.checkoutLocalBranch(newBranch);
+					await this.commitLocalChanges(git);
+					if (await this.remoteBranchExists(git, baseBranch)) {
+						try {
+							await git.rebase([`origin/${baseBranch}`]);
+						} catch (error) {
+							await this.updateBranchStatus(git);
+							await this.showConflicts(git, error);
+							return;
+						}
+					}
+				} else {
+					await this.requireSynchronizedBranch(git, currentBranch);
+					await git.checkout(baseBranch);
+					if (await this.remoteBranchExists(git, baseBranch)) {
+						await git.pull('origin', baseBranch, { '--ff-only': null });
+					}
+					await git.checkoutLocalBranch(newBranch);
 				}
-				await git.checkoutLocalBranch(newBranch);
 				await git.push('origin', newBranch, ['-u']);
 				await this.updateBranchStatus(git);
 				this.showNotice(`Started change: ${newBranch}`, 'INFO', 8000);
@@ -261,6 +308,41 @@ export default class GHSyncPlugin extends Plugin {
 		});
 	}
 
+	async switchBranch(targetBranch: string): Promise<void> {
+		await this.withGitLock(async () => {
+			try {
+				if (!isSafeBranchRef(targetBranch)) throw new Error('The selected branch name is invalid.');
+				const git = this.getGit();
+				if (!(await git.status()).isClean()) {
+					throw new Error('Sync or discard your current edits before switching branches.');
+				}
+				await this.configureRemote(git);
+				await git.fetch('origin');
+				const currentBranch = await this.currentBranch(git);
+				if (currentBranch === targetBranch) {
+					this.showNotice(`Already on ${targetBranch}`, 'INFO');
+					return;
+				}
+				await this.requireSynchronizedBranch(git, currentBranch);
+				const localBranches = await git.branchLocal();
+				if (localBranches.all.includes(targetBranch)) {
+					await git.checkout(targetBranch);
+				} else if (await this.remoteBranchExists(git, targetBranch)) {
+					await git.checkout(['-b', targetBranch, `origin/${targetBranch}`]);
+				} else {
+					throw new Error(`The branch ${targetBranch} no longer exists.`);
+				}
+				if (await this.remoteBranchExists(git, targetBranch)) {
+					await git.pull('origin', targetBranch, { '--ff-only': null });
+				}
+				await this.updateBranchStatus(git);
+				this.showNotice(`Switched to ${targetBranch}`, 'INFO');
+			} catch (error) {
+				this.showNotice(error, 'ERROR', 10000);
+			}
+		});
+	}
+
 	async checkStatusOnStart(): Promise<void> {
 		try {
 			const git = this.getGit();
@@ -274,7 +356,7 @@ export default class GHSyncPlugin extends Plugin {
 			}
 			const { behind } = await this.branchDivergence(git, branch);
 			if (behind > 0) {
-				if (this.settings.isSyncOnLoad) await this.syncNotes();
+				if (this.settings.isSyncOnLoad) await this.syncNotes(false);
 				else this.showNotice(`${branch} is ${behind} commit(s) behind. Sync before editing.`, 'WARNING');
 			} else {
 				this.showNotice(`${branch} is up to date.`, 'INFO');
@@ -288,11 +370,14 @@ export default class GHSyncPlugin extends Plugin {
 		await this.loadSettings();
 		this.branchStatusEl = this.addStatusBarItem();
 		this.branchStatusEl.addClass('gh-sync-status');
+		this.registerDomEvent(this.branchStatusEl, 'click', () => this.openBranchManager());
 
 		const ribbonIconEl = this.addRibbonIcon('github', 'Sync current branch', () => void this.syncNotes());
 		ribbonIconEl.addClass('gh-sync-ribbon');
+		this.addRibbonIcon('git-branch', 'Open branch manager', () => this.openBranchManager());
 
 		this.addCommand({ id: 'github-sync-command', name: 'Sync current branch', callback: () => void this.syncNotes() });
+		this.addCommand({ id: 'github-sync-branch-manager', name: 'Open branch manager', callback: () => this.openBranchManager() });
 		this.addCommand({
 			id: 'github-sync-start-change',
 			name: 'Start a change branch',
@@ -303,7 +388,7 @@ export default class GHSyncPlugin extends Plugin {
 
 		const interval = this.settings.syncinterval;
 		if (Number.isFinite(interval) && interval >= 1) {
-			this.syncTimer = setIntervalAsync(() => this.syncNotes(), interval * 60 * 1000);
+			this.syncTimer = setIntervalAsync(() => this.syncNotes(false), interval * 60 * 1000);
 			this.showNotice('Automatic branch sync enabled.', 'INFO');
 		}
 		if (this.settings.checkStatusOnLoad) void this.checkStatusOnStart();
@@ -321,6 +406,73 @@ export default class GHSyncPlugin extends Plugin {
 
 	async saveSettings(): Promise<void> {
 		await this.saveData(this.settings);
+	}
+}
+
+class BranchManagerModal extends Modal {
+	constructor(app: App, private readonly plugin: GHSyncPlugin) {
+		super(app);
+	}
+
+	onOpen(): void {
+		void this.render();
+	}
+
+	private async render(): Promise<void> {
+		this.contentEl.empty();
+		this.contentEl.createEl('h2', { text: 'Documentation branches' });
+		const loading = this.contentEl.createEl('p', { text: 'Loading branches…' });
+		try {
+			const snapshot = await this.plugin.getBranchSnapshot();
+			loading.remove();
+
+			new Setting(this.contentEl)
+				.setName('Current branch')
+				.setDesc(snapshot.current === snapshot.base
+					? `${snapshot.current} is the accepted documentation branch. Start a change before editing.`
+					: `Edits and syncs are going to ${snapshot.current}.`)
+				.addButton((button) => button.setButtonText('Sync current').onClick(() => {
+					this.close();
+					void this.plugin.syncNotes();
+				}));
+
+			new Setting(this.contentEl)
+				.setName('Start a new change')
+				.setDesc(`Create a new branch from ${snapshot.base}.`)
+				.addButton((button) => button.setButtonText('Start change').setCta().onClick(() => {
+					this.close();
+					new BranchNameModal(this.app, (title) => void this.plugin.startChange(title)).open();
+				}));
+
+			let selectedBranch = snapshot.current;
+			new Setting(this.contentEl)
+				.setName('Switch to an existing branch')
+				.setDesc('Local and GitHub branches are listed together.')
+				.addDropdown((dropdown) => {
+					for (const branch of snapshot.branches) dropdown.addOption(branch, branch);
+					return dropdown.setValue(snapshot.current).onChange((value) => selectedBranch = value);
+				})
+				.addButton((button) => button.setButtonText('Switch').onClick(() => {
+					this.close();
+					void this.plugin.switchBranch(selectedBranch);
+				}));
+
+			if (snapshot.current !== snapshot.base) {
+				new Setting(this.contentEl)
+					.setName(`Return to ${snapshot.base}`)
+					.setDesc('Use this after the current change has been synchronized and merged.')
+					.addButton((button) => button.setButtonText(`Return to ${snapshot.base}`).onClick(() => {
+						this.close();
+						void this.plugin.returnToBaseBranch();
+					}));
+			}
+		} catch (error) {
+			loading.setText(`Could not load branches: ${redactSensitiveText(error)}`);
+		}
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
 	}
 }
 
@@ -362,7 +514,7 @@ class GHSyncSettingTab extends PluginSettingTab {
 
 		const howto = containerEl.createEl('div', { cls: 'howto' });
 		howto.createEl('div', { text: 'Branch-based documentation workflow', cls: 'howto_title' });
-		howto.createEl('small', { text: 'Use “Start a change branch”, edit normally, then use “Sync current branch”. Return to the base branch after the change is merged.', cls: 'howto_text' });
+		howto.createEl('small', { text: 'The base branch is not a branch selector. Use the Branch Manager to start or switch changes, then sync the explicitly displayed current branch.', cls: 'howto_text' });
 
 		new Setting(containerEl)
 			.setName('Remote URL')
@@ -374,9 +526,17 @@ class GHSyncSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('Base branch')
-			.setDesc('The accepted documentation branch used as the starting point for new changes.')
+			.setDesc('The accepted documentation branch used as the starting point for changes. This is not the current branch selector.')
 			.addText((text) => text.setPlaceholder('main').setValue(this.plugin.settings.baseBranch).onChange(async (value) => {
 				this.plugin.settings.baseBranch = value;
+				await this.plugin.saveSettings();
+			}));
+
+		new Setting(containerEl)
+			.setName('Protect base branch')
+			.setDesc('Prevent edited files from being committed directly to the base branch. Recommended for non-technical teams.')
+			.addToggle((toggle) => toggle.setValue(this.plugin.settings.protectBaseBranch).onChange(async (value) => {
+				this.plugin.settings.protectBaseBranch = value;
 				await this.plugin.saveSettings();
 			}));
 

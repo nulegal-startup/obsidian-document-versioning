@@ -8,7 +8,10 @@ This fork adds a non-technical, branch-based documentation workflow to Kevin Chi
 - Generate safe branch names such as `changes/next-sprint-billing` from human-readable titles.
 - Synchronize the current branch instead of always pushing to `main`.
 - Return safely to the configured base branch after a change is merged.
-- Display the current branch in Obsidian's status bar.
+- Protect the accepted branch from direct commits by default.
+- Open a branch manager from the status bar or branch ribbon icon.
+- Display, switch, and synchronize the explicitly selected current branch.
+- Carry edits accidentally made on `main` into a new change branch before committing them.
 - Refuse to switch branches when local or remote work is not synchronized.
 - Stop on merge conflicts and open each conflicting note for resolution.
 - Prevent overlapping manual, startup, and scheduled Git operations.
@@ -16,12 +19,16 @@ This fork adds a non-technical, branch-based documentation workflow to Kevin Chi
 
 ## Documentation workflow
 
-1. Open the command palette and choose **GitHub Sync: Start a change branch**.
+1. Click **Git: main** in the status bar or the branch ribbon icon to open the branch manager.
 2. Enter a short change name, such as `Next sprint billing`.
 3. Edit notes normally in Obsidian.
 4. Choose **GitHub Sync: Sync current branch** or click the GitHub ribbon icon.
 5. Open a pull request on GitHub when the change is ready for review.
-6. After the pull request is merged, choose **GitHub Sync: Return to base branch**.
+6. After the pull request is merged, use **Return to main** in the branch manager.
+
+The branch manager also lists existing local and GitHub branches. Switching is allowed only when the current branch is clean and synchronized, preventing uncommitted edits from being silently carried between changes.
+
+If files were edited while still on protected `main`, clicking Sync does not commit them to `main`. It opens the branch manager; **Start change** creates the new branch and commits those edits there.
 
 The default accepted branch is `main`, and the default change prefix is `changes`.
 
@@ -31,6 +38,7 @@ Your Obsidian vault must already be a Git repository with an `origin` remote. Co
 
 - **Remote URL:** an HTTPS URL without credentials, or an SSH URL.
 - **Base branch:** normally `main`.
+- **Protect base branch:** keep enabled to prevent direct commits to `main`.
 - **Change branch prefix:** normally `changes`.
 - **Git binary location:** leave empty when Git is available on your system path.
 
