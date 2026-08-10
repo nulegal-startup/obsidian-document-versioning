@@ -3,7 +3,14 @@ import { simpleGit, SimpleGit, SimpleGitOptions, StatusResult } from 'simple-git
 import { clearIntervalAsync, setIntervalAsync } from 'set-interval-async';
 import * as os from 'os';
 import * as path from 'path';
-import { isSafeBranchRef, normalizeBranchName, redactSensitiveText, validateRemoteUrl } from './branch-utils';
+import {
+	BranchSyncSummary,
+	describeBranchSync,
+	isSafeBranchRef,
+	normalizeBranchName,
+	redactSensitiveText,
+	validateRemoteUrl,
+} from './branch-utils';
 
 type NoticeLevelSetting = 'ALL' | 'WARNING' | 'ERROR';
 type LegacyNoticeLevelSetting = NoticeLevelSetting | 'WARNINGS';
@@ -39,6 +46,8 @@ interface BranchSnapshot {
 	current: string;
 	base: string;
 	branches: string[];
+	sync: BranchSyncSummary;
+	isClean: boolean;
 }
 
 type OperationResult = {
@@ -150,6 +159,9 @@ export default class GHSyncPlugin extends Plugin {
 	private branchStatusEl?: HTMLElement;
 	private headerBranchBadgeEl?: HTMLButtonElement;
 	private displayedBranch?: string;
+	private displayedSync?: BranchSyncSummary;
+	private displayedDirty = false;
+	private dirtyRefreshTimer?: number;
 	private readonly gitControlEls: HTMLElement[] = [];
 
 	private shouldShowNotice(severity: NoticeSeverity): boolean {
@@ -238,28 +250,46 @@ export default class GHSyncPlugin extends Plugin {
 		await this.configureRemote(git);
 		await git.fetch('origin');
 		const current = await this.currentBranch(git);
+		const status = await git.status();
+		const published = await this.remoteBranchExists(git, current);
+		const divergence = published ? await this.branchDivergence(git, current) : { ahead: 0, behind: 0 };
+		const sync = describeBranchSync(divergence.ahead, divergence.behind, published);
 		const allBranches = await git.branch(['-a']);
 		const branches = Array.from(new Set(allBranches.all
 			.map((branch) => branch.replace(/^remotes\/origin\//, '').replace(/^origin\//, ''))
 			.filter((branch) => branch !== 'HEAD' && isSafeBranchRef(branch))))
 			.sort((left, right) => left.localeCompare(right));
-		return { current, base: this.getBaseBranch(), branches };
+		await this.updateBranchStatus(git, sync);
+		return { current, base: this.getBaseBranch(), branches, sync, isClean: status.isClean() };
 	}
 
 	openBranchManager(): void {
 		new BranchManagerModal(this.app, this).open();
 	}
 
-	private async updateBranchStatus(git?: SimpleGit): Promise<void> {
+	private async updateBranchStatus(git?: SimpleGit, sync?: BranchSyncSummary): Promise<void> {
 		if (!this.branchStatusEl) return;
 		try {
-			const branch = await this.currentBranch(git ?? this.getGit());
+			const gitInstance = git ?? this.getGit();
+			const branch = await this.currentBranch(gitInstance);
+			this.displayedDirty = !(await gitInstance.status()).isClean();
+			if (branch !== this.displayedBranch && !sync) this.displayedSync = undefined;
 			this.displayedBranch = branch;
+			if (sync) this.displayedSync = sync;
 			this.branchStatusEl.empty();
 			const icon = this.branchStatusEl.createSpan({ cls: 'gh-sync-status__icon' });
 			setIcon(icon, 'git-branch');
 			this.branchStatusEl.createSpan({ text: branch });
-			this.branchStatusEl.setAttr('title', `Current documentation branch: ${branch}`);
+			if (this.displayedSync) {
+				this.branchStatusEl.createSpan({
+					cls: `gh-sync-status__state is-${this.displayedSync.state}`,
+					text: this.displayedSync.compact,
+				});
+			}
+			if (this.displayedDirty) this.branchStatusEl.createSpan({ cls: 'gh-sync-status__dirty', text: '●' });
+			const stateDescription = this.displayedSync ? ` ${this.displayedSync.label}.` : '';
+			const dirtyDescription = this.displayedDirty ? ' Local edits.' : '';
+			this.branchStatusEl.setAttr('title', `Current documentation branch: ${branch}.${stateDescription}${dirtyDescription}`);
 			this.branchStatusEl.setAttr('aria-busy', 'false');
 			this.renderHeaderBranchBadge();
 		} catch {
@@ -289,8 +319,17 @@ export default class GHSyncPlugin extends Plugin {
 		const icon = this.headerBranchBadgeEl.createSpan({ cls: 'gh-sync-header-branch__icon' });
 		setIcon(icon, 'git-branch');
 		this.headerBranchBadgeEl.createSpan({ cls: 'gh-sync-header-branch__label', text: this.displayedBranch });
-		this.headerBranchBadgeEl.setAttr('title', `Current documentation branch: ${this.displayedBranch}. Click to manage branches.`);
-		this.headerBranchBadgeEl.setAttr('aria-label', `Current documentation branch: ${this.displayedBranch}. Open branch manager.`);
+		if (this.displayedSync) {
+			this.headerBranchBadgeEl.createSpan({
+				cls: `gh-sync-header-branch__state is-${this.displayedSync.state}`,
+				text: this.displayedSync.compact,
+			});
+		}
+		if (this.displayedDirty) this.headerBranchBadgeEl.createSpan({ cls: 'gh-sync-header-branch__dirty', text: '●' });
+		const stateDescription = this.displayedSync ? ` ${this.displayedSync.label}.` : '';
+		const dirtyDescription = this.displayedDirty ? ' Local edits.' : '';
+		this.headerBranchBadgeEl.setAttr('title', `Current documentation branch: ${this.displayedBranch}.${stateDescription}${dirtyDescription} Click to manage branches.`);
+		this.headerBranchBadgeEl.setAttr('aria-label', `Current documentation branch: ${this.displayedBranch}.${stateDescription}${dirtyDescription} Open branch manager.`);
 		const actions = header.querySelector('.view-actions');
 		if (actions) header.insertBefore(this.headerBranchBadgeEl, actions);
 		else header.appendChild(this.headerBranchBadgeEl);
@@ -403,9 +442,39 @@ export default class GHSyncPlugin extends Plugin {
 
 			progress.step(`Pushing ${branch} to GitHub`);
 			await git.push('origin', branch, ['-u']);
-			await this.updateBranchStatus(git);
+			await this.updateBranchStatus(git, describeBranchSync(0, 0, true));
 			return { status: 'success', message: `Synced ${branch}` };
 		}, this.settings.showSyncSuccessNotice);
+	}
+
+	async updateCurrentBranch(): Promise<void> {
+		await this.withGitLock('Updating documentation branch', async (progress) => {
+			progress.step('Checking for local edits');
+			const git = this.getGit();
+			if (!(await git.status()).isClean()) {
+				throw new Error('This branch has local edits. Use Sync current to save and merge them safely.');
+			}
+
+			progress.step('Fetching updates from GitHub');
+			await this.configureRemote(git);
+			await git.fetch('origin');
+			const branch = await this.currentBranch(git);
+			const published = await this.remoteBranchExists(git, branch);
+			if (!published) throw new Error(`${branch} has not been published. Use Sync current to publish it.`);
+
+			const { ahead, behind } = await this.branchDivergence(git, branch);
+			await this.updateBranchStatus(git, describeBranchSync(ahead, behind, true));
+			if (ahead > 0) {
+				const detail = behind > 0 ? `${ahead} ahead and ${behind} behind` : `${ahead} ahead`;
+				throw new Error(`${branch} is ${detail}. Use Sync current to merge and publish local commits safely.`);
+			}
+			if (behind === 0) return { status: 'success', message: `${branch} is already up to date` };
+
+			progress.step(`Fast-forwarding ${branch}`);
+			await git.pull('origin', branch, { '--ff-only': null });
+			await this.updateBranchStatus(git, describeBranchSync(0, 0, true));
+			return { status: 'success', message: `Updated ${branch} with ${behind} remote commit${behind === 1 ? '' : 's'}` };
+		});
 	}
 
 	async startChange(changeTitle: string): Promise<void> {
@@ -459,7 +528,7 @@ export default class GHSyncPlugin extends Plugin {
 
 			progress.step(`Publishing ${newBranch} to GitHub`);
 			await git.push('origin', newBranch, ['-u']);
-			await this.updateBranchStatus(git);
+			await this.updateBranchStatus(git, describeBranchSync(0, 0, true));
 			return { status: 'success', message: `Started change: ${newBranch}` };
 		});
 	}
@@ -485,7 +554,7 @@ export default class GHSyncPlugin extends Plugin {
 				progress.step(`Updating ${baseBranch}`);
 				await git.pull('origin', baseBranch, { '--ff-only': null });
 			}
-			await this.updateBranchStatus(git);
+			await this.updateBranchStatus(git, describeBranchSync(0, 0, true));
 			return { status: 'success', message: `Returned to ${baseBranch}` };
 		});
 	}
@@ -522,29 +591,44 @@ export default class GHSyncPlugin extends Plugin {
 				progress.step(`Updating ${targetBranch}`);
 				await git.pull('origin', targetBranch, { '--ff-only': null });
 			}
-			await this.updateBranchStatus(git);
+			await this.updateBranchStatus(git, describeBranchSync(0, 0, true));
 			return { status: 'success', message: `Switched to ${targetBranch}` };
 		});
 	}
 
-	async checkStatusOnStart(): Promise<void> {
+	async checkStatusOnStart(autoUpdate = this.settings.isSyncOnLoad, showNotices = true): Promise<void> {
+		if (this.syncInProgress) return;
 		try {
 			const git = this.getGit();
 			await this.configureRemote(git);
 			await git.fetch('origin');
 			const branch = await this.currentBranch(git);
-			await this.updateBranchStatus(git);
-			if (!(await this.remoteBranchExists(git, branch))) {
-				this.showNotice(`${branch} has not been published yet. Sync to publish it.`, 'WARNING');
+			const status = await git.status();
+			const published = await this.remoteBranchExists(git, branch);
+			if (!published) {
+				await this.updateBranchStatus(git, describeBranchSync(0, 0, false));
+				if (showNotices) this.showNotice(`${branch} has not been published yet. Sync to publish it.`, 'WARNING');
 				return;
 			}
-			const { behind } = await this.branchDivergence(git, branch);
-			if (behind > 0) {
-				if (this.settings.isSyncOnLoad) await this.syncNotes(false);
-				else this.showNotice(`${branch} is ${behind} commit(s) behind. Sync before editing.`, 'WARNING');
-			} else {
-				this.showNotice(`${branch} is up to date.`, 'INFO');
+			const { ahead, behind } = await this.branchDivergence(git, branch);
+			await this.updateBranchStatus(git, describeBranchSync(ahead, behind, true));
+			if (!status.isClean()) {
+				const remoteDetail = behind > 0 ? ` and is ${behind} commit(s) behind` : '';
+				if (showNotices) this.showNotice(`${branch} has local edits${remoteDetail}. Use Sync current before switching branches.`, 'WARNING');
+				return;
 			}
+			if (behind > 0) {
+				if (ahead > 0) {
+					if (showNotices) this.showNotice(`${branch} is ${ahead} ahead and ${behind} behind. Use Sync current to merge both histories.`, 'WARNING');
+				} else if (autoUpdate) {
+					await this.updateCurrentBranch();
+				} else if (showNotices) {
+					this.showNotice(`${branch} is ${behind} commit(s) behind. Use Update branch before editing.`, 'WARNING');
+				}
+				return;
+			}
+			if (showNotices && ahead > 0) this.showNotice(`${branch} has ${ahead} local commit(s) to publish. Use Sync current.`, 'WARNING');
+			else if (showNotices) this.showNotice(`${branch} is up to date.`, 'INFO');
 		} catch {
 			await this.updateBranchStatus();
 		}
@@ -562,6 +646,12 @@ export default class GHSyncPlugin extends Plugin {
 			window.setTimeout(() => this.renderHeaderBranchBadge(), 0);
 		}));
 		this.registerEvent(this.app.workspace.on('layout-change', () => this.renderHeaderBranchBadge()));
+		this.registerEvent(this.app.vault.on('modify', () => {
+			if (this.dirtyRefreshTimer) window.clearTimeout(this.dirtyRefreshTimer);
+			this.dirtyRefreshTimer = window.setTimeout(() => {
+				if (!this.syncInProgress) void this.updateBranchStatus();
+			}, 350);
+		}));
 
 		const ribbonIconEl = this.addRibbonIcon('github', 'Sync current branch', () => void this.syncNotes());
 		ribbonIconEl.addClass('gh-sync-ribbon');
@@ -572,6 +662,7 @@ export default class GHSyncPlugin extends Plugin {
 		this.gitControlEls.push(ribbonIconEl, branchRibbonEl);
 
 		this.addCommand({ id: 'github-sync-command', name: 'Sync current branch', callback: () => void this.syncNotes() });
+		this.addCommand({ id: 'github-sync-update-current', name: 'Update current branch from GitHub', callback: () => void this.updateCurrentBranch() });
 		this.addCommand({ id: 'github-sync-branch-manager', name: 'Open branch manager', callback: () => this.openBranchManager() });
 		this.addCommand({
 			id: 'github-sync-start-change',
@@ -583,8 +674,8 @@ export default class GHSyncPlugin extends Plugin {
 
 		const interval = this.settings.syncinterval;
 		if (Number.isFinite(interval) && interval >= 1) {
-			this.syncTimer = setIntervalAsync(() => this.syncNotes(false), interval * 60 * 1000);
-			this.showNotice('Automatic branch sync enabled.', 'INFO');
+			this.syncTimer = setIntervalAsync(() => this.checkStatusOnStart(true, false), interval * 60 * 1000);
+			this.showNotice('Automatic safe branch updates enabled.', 'INFO');
 		}
 		if (this.settings.checkStatusOnLoad) void this.checkStatusOnStart();
 		else void this.updateBranchStatus();
@@ -592,6 +683,7 @@ export default class GHSyncPlugin extends Plugin {
 
 	onunload(): void {
 		if (this.syncTimer) void clearIntervalAsync(this.syncTimer);
+		if (this.dirtyRefreshTimer) window.clearTimeout(this.dirtyRefreshTimer);
 	}
 
 	async loadSettings(): Promise<void> {
@@ -621,15 +713,51 @@ class BranchManagerModal extends Modal {
 			const snapshot = await this.plugin.getBranchSnapshot();
 			loading.remove();
 
-			new Setting(this.contentEl)
-				.setName('Current branch')
-				.setDesc(snapshot.current === snapshot.base
-					? `${snapshot.current} is the accepted documentation branch. Start a change before editing.`
-					: `Edits and syncs are going to ${snapshot.current}.`)
-				.addButton((button) => button.setButtonText('Sync current').onClick(() => {
+			const currentDescription = snapshot.isClean
+				? snapshot.current === snapshot.base
+					? 'Accepted documentation branch.'
+					: 'Edits and syncs use this branch.'
+				: snapshot.current === snapshot.base
+					? 'Local edits are protected. Move them to a change branch.'
+					: 'Local edits have not been synchronized yet.';
+			const currentSetting = new Setting(this.contentEl)
+				.setName(snapshot.current)
+				.setDesc(currentDescription);
+			currentSetting.nameEl.createSpan({
+				cls: `gh-sync-state-pill is-${snapshot.sync.state}`,
+				text: snapshot.sync.label,
+			});
+			if (!snapshot.isClean) {
+				currentSetting.nameEl.createSpan({ cls: 'gh-sync-state-pill is-dirty', text: 'Local edits' });
+			}
+
+			if (snapshot.current === snapshot.base && !snapshot.isClean) {
+				currentSetting.addButton((button) => button.setButtonText('Start change').setCta().onClick(() => {
 					this.close();
-					void this.plugin.syncNotes();
+					new BranchNameModal(this.app, (title) => void this.plugin.startChange(title)).open();
 				}));
+			} else if (snapshot.sync.state === 'behind' && snapshot.isClean) {
+				currentSetting.addButton((button) => button.setButtonText('Update branch').setCta().onClick(() => {
+					this.close();
+					void this.plugin.updateCurrentBranch();
+				}));
+			} else {
+				const syncLabel = snapshot.sync.state === 'diverged' || (snapshot.sync.state === 'behind' && !snapshot.isClean)
+					? 'Sync & merge'
+					: snapshot.sync.state === 'ahead'
+						? 'Push changes'
+						: snapshot.sync.state === 'unpublished'
+							? 'Publish branch'
+							: snapshot.isClean ? 'Sync current' : 'Sync edits';
+				currentSetting.addButton((button) => {
+					button.setButtonText(syncLabel);
+					if (snapshot.sync.state !== 'up-to-date' || !snapshot.isClean) button.setCta();
+					button.onClick(() => {
+						this.close();
+						void this.plugin.syncNotes();
+					});
+				});
+			}
 
 			new Setting(this.contentEl)
 				.setName('Start a new change')
@@ -774,23 +902,23 @@ class GHSyncSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('Check status on startup')
-			.setDesc('Check whether the current branch is behind its remote branch.')
+			.setDesc('Show whether the current branch is ahead, behind, diverged, or up to date.')
 			.addToggle((toggle) => toggle.setValue(this.plugin.settings.checkStatusOnLoad).onChange(async (value) => {
 				this.plugin.settings.checkStatusOnLoad = value;
 				await this.plugin.saveSettings();
 			}));
 
 		new Setting(containerEl)
-			.setName('Auto sync on startup')
-			.setDesc('Synchronize the current branch automatically when it is behind.')
+			.setName('Auto update on startup')
+			.setDesc('Fast-forward automatically only when the branch is clean and has remote-only updates. Local work still requires explicit Sync.')
 			.addToggle((toggle) => toggle.setValue(this.plugin.settings.isSyncOnLoad).onChange(async (value) => {
 				this.plugin.settings.isSyncOnLoad = value;
 				await this.plugin.saveSettings();
 			}));
 
 		new Setting(containerEl)
-			.setName('Auto sync interval')
-			.setDesc('Minutes between synchronizations. Use 0 to disable; restart Obsidian after changing.')
+			.setName('Auto update interval')
+			.setDesc('Minutes between safe remote checks. Clean remote-only updates fast-forward automatically; local work is never committed. Use 0 to disable.')
 			.addText((text) => text.setValue(String(this.plugin.settings.syncinterval)).onChange(async (value) => {
 				this.plugin.settings.syncinterval = Number(value);
 				await this.plugin.saveSettings();

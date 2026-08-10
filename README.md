@@ -17,6 +17,9 @@ This fork adds a non-technical, branch-based documentation workflow to Kevin Chi
 - Keep errors and action-needed states visible long enough to understand what happened.
 - Follow Obsidian's live light/dark appearance when its base color scheme adapts to the system.
 - Show the current branch as a clickable badge in the active note header and status bar.
+- Display deterministic `ahead`, `behind`, `diverged`, `up to date`, and `not published` branch states.
+- Fast-forward clean remote-only updates through an explicit **Update branch** action.
+- Require **Sync current** when local edits or commits must be saved, merged, or pushed.
 - Refuse to switch branches when local or remote work is not synchronized.
 - Stop on merge conflicts and open each conflicting note for resolution.
 - Prevent overlapping manual, startup, and scheduled Git operations.
@@ -36,6 +39,8 @@ The branch manager also lists existing local and GitHub branches. Switching is a
 If files were edited while still on protected `main`, clicking Sync does not commit them to `main`. It opens the branch manager; **Start change** creates the new branch and commits those edits there.
 
 Git operations run in the background with a non-blocking activity card. Completed stages receive check marks, the active stage appears in both the card and status bar, and the final state clearly reports success, required action, or failure. The progress is stage-based because Git does not expose a reliable percentage for every operation.
+
+The branch badge uses `↓N` for remote commits not yet pulled, `↑N` for local commits not yet pushed, and both when histories have diverged. Opening the Branch Manager refreshes this state from GitHub. A clean branch that is only behind can be fast-forwarded with **Update branch**; branches with local work use **Sync current** so the remote history is merged without force-pushing.
 
 The default accepted branch is `main`, and the default change prefix is `changes`.
 

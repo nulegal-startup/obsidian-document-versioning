@@ -74,3 +74,21 @@ export function redactSensitiveText(value: unknown): string {
 		.replace(/https:\/\/[^\s/@:]+:[^\s/@]+@/gi, 'https://***:***@')
 		.replace(/\b(?:ghp|github_pat|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{10,}\b/g, '[REDACTED]');
 }
+
+export type BranchSyncState = 'up-to-date' | 'behind' | 'ahead' | 'diverged' | 'unpublished';
+
+export interface BranchSyncSummary {
+	state: BranchSyncState;
+	label: string;
+	compact: string;
+}
+
+export function describeBranchSync(ahead: number, behind: number, published: boolean): BranchSyncSummary {
+	if (!published) return { state: 'unpublished', label: 'Not published', compact: 'Local only' };
+	if (ahead > 0 && behind > 0) {
+		return { state: 'diverged', label: `${ahead} ahead · ${behind} behind`, compact: `↑${ahead} ↓${behind}` };
+	}
+	if (behind > 0) return { state: 'behind', label: `${behind} behind`, compact: `↓${behind}` };
+	if (ahead > 0) return { state: 'ahead', label: `${ahead} ahead`, compact: `↑${ahead}` };
+	return { state: 'up-to-date', label: 'Up to date', compact: '✓' };
+}
