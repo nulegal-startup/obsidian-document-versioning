@@ -1053,6 +1053,23 @@
 }
 
 .gh-sync-review-thread__body { line-height: 1.5; white-space: pre-wrap; }
+
+.gh-sync-review-thread__navigation-target {
+  border-radius: var(--radius-s);
+  cursor: pointer;
+  transition-property: background-color, box-shadow;
+  transition-duration: 120ms;
+  transition-timing-function: ease-out;
+}
+
+.gh-sync-review-thread__navigation-target:hover {
+  background: var(--background-modifier-hover);
+}
+
+.gh-sync-review-thread__navigation-target:focus-visible {
+  box-shadow: 0 0 0 2px var(--background-modifier-border-focus);
+  outline: none;
+}
 .gh-sync-review-thread__meta,
 .gh-sync-review-thread__reply-meta { color: var(--text-faint); font-size: var(--font-ui-smaller); margin-top: 6px; }
 

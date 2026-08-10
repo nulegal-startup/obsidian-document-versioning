@@ -661,9 +661,19 @@ export default class GHSyncPlugin extends Plugin {
 		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
 		if (view) {
 			const position = reanchorText(view.editor.getValue(), comment.metadata.anchor);
-			const line = Math.max(0, position.startLine - 1);
-			view.editor.setCursor({ line, ch: 0 });
-			view.editor.scrollIntoView({ from: { line, ch: 0 }, to: { line, ch: 0 } }, true);
+			view.editor.focus();
+			if (position.confidence !== 'orphaned' && position.from >= 0 && position.to >= position.from) {
+				const from = view.editor.offsetToPos(position.from);
+				const to = view.editor.offsetToPos(position.to);
+				view.editor.setSelection(from, to);
+				view.editor.scrollIntoView({ from, to }, true);
+			} else {
+				const line = Math.max(0, position.startLine - 1);
+				const fallback = { line, ch: 0 };
+				view.editor.setCursor(fallback);
+				view.editor.scrollIntoView({ from: fallback, to: fallback }, true);
+				this.showNotice('The original commented text was removed. Opened its previous line instead.', 'WARNING');
+			}
 		}
 	}
 
@@ -1216,13 +1226,26 @@ class ReviewCenterView extends ItemView {
 			const location = top.createEl('button', { cls: 'gh-sync-review-thread__location', attr: { type: 'button' } });
 			setIcon(location.createSpan(), 'file-text');
 			location.createSpan({ text: `${comment.metadata.anchor.path} · lines ${comment.metadata.anchor.startLine}–${comment.metadata.anchor.endLine}` });
-			location.addEventListener('click', () => void this.plugin.openReviewComment(comment));
+			const openComment = (): void => void this.plugin.openReviewComment(comment);
+			location.addEventListener('click', openComment);
 			top.createSpan({ cls: `gh-sync-review-thread__state${comment.metadata.state === 'resolved' ? ' is-resolved' : ''}`, text: comment.metadata.state === 'resolved' ? 'Resolved' : 'Open' });
 
 			const quote = thread.createEl('blockquote', { text: comment.metadata.anchor.selectedText.slice(0, 500) });
 			if (comment.metadata.anchor.selectedText.length > 500) quote.createSpan({ text: '…' });
 			const body = thread.createDiv({ cls: 'gh-sync-review-thread__body', text: comment.body.replace(/^(?:>.*\n?)+\s*/m, '') });
 			body.setAttr('data-author', `@${comment.author}`);
+			for (const target of [quote, body]) {
+				target.addClass('gh-sync-review-thread__navigation-target');
+				target.setAttr('role', 'link');
+				target.setAttr('tabindex', '0');
+				target.setAttr('aria-label', `Open ${comment.metadata.anchor.path} and select the commented text`);
+				target.addEventListener('click', openComment);
+				target.addEventListener('keydown', (event: KeyboardEvent) => {
+					if (event.key !== 'Enter' && event.key !== ' ') return;
+					event.preventDefault();
+					openComment();
+				});
+			}
 			thread.createDiv({ cls: 'gh-sync-review-thread__meta', text: `@${comment.author} · ${new Date(comment.createdAt).toLocaleString()}` });
 
 			for (const reply of snapshot.comments.filter((candidate) => candidate.metadata.parentId === comment.id)) {
