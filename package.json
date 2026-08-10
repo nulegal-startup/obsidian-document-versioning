@@ -1,6 +1,6 @@
 {
 	"name": "github-sync",
-	"version": "1.7.0",
+	"version": "1.8.0",
 	"author": "NuLegal",
 	"description": "Sync an Obsidian vault through safe, branch-based documentation changes.",
 	"main": "main.js",

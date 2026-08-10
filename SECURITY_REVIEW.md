@@ -1,6 +1,6 @@
 # Security Review
 
-Review scope: branch workflow fork of Obsidian GitHub Sync, including Git command construction, vault changes, remote configuration, credentials, dependencies, conflict behavior, and optional AI conflict suggestions.
+Review scope: branch workflow fork of Obsidian GitHub Sync, including Git and GitHub CLI command construction, vault changes, remote configuration, credentials, dependencies, selected-text reviews, conflict behavior, and optional AI conflict suggestions.
 
 ## Resolved findings
 
@@ -44,21 +44,28 @@ AI output is never written, staged, committed, or pushed automatically. The user
 
 Raw conflict ranges are parsed deterministically and resolved one section at a time. **Mark resolved** refuses to stage while any complete conflict marker remains, rechecks Git's conflicted-file list, and stages only the explicitly selected path using `git add -- <path>`. File paths are normalized and prevented from escaping the vault.
 
+### High — review comments could introduce command or UI injection
+
+GitHub review operations invoke the authenticated `gh` executable with argument arrays and never use a shell. Branch, repository, executable, path, selection, comment, and metadata lengths or formats are validated or bounded. Remote comment text, authors, quotes, and errors are rendered as text rather than HTML. Hidden metadata is versioned, size-bounded, structurally validated, and rejects absolute or parent-traversal paths before a note can be opened.
+
+The plugin delegates credentials to GitHub CLI and never reads or stores its token. Draft review creation is fail-open only with respect to Git synchronization: a GitHub review API or authentication failure is reported but cannot prevent the already-authorized branch push from completing.
+
 ## Residual risks
 
 - The plugin executes the Git binary configured by the local user. A malicious person who can alter Obsidian plugin settings already has access equivalent to that desktop user.
 - Git authentication remains delegated to SSH or the operating system's Git credential manager.
 - The plugin commits all non-ignored vault changes. Repository owners must maintain an appropriate `.gitignore` and avoid storing secrets in notes.
 - Git provides asynchronous collaboration, not live co-editing. Simultaneous changes to the same lines can still require human conflict resolution.
-- Pull-request creation and merge authorization remain on GitHub and are not implemented in this plugin.
+- Draft pull-request creation and comments use the permissions of the locally authenticated GitHub CLI account. Repository owners remain responsible for access control, branch protection, retention, and merge authorization.
+- Selected text and bounded surrounding context are stored in hidden GitHub comment metadata. They are visible to repository collaborators who can read the pull request and must be treated as repository data, not local-only notes.
 - Codex may send the selected conflict to OpenAI under the user's configured Codex account. Ollama and LM Studio keep inference local only when the user's local provider configuration does so. Users remain responsible for provider data-retention and model policies.
 - Delimiting note content reduces prompt-injection risk but cannot guarantee that every model ignores adversarial document text. Suggestions remain untrusted until reviewed.
 
 ## Verification
 
 - TypeScript production build
-- Unit tests for branch normalization, reference validation, remote validation, secret redaction, multi-hunk parsing, per-hunk resolution, bounded AI prompt scope, and structured-output rejection
+- Unit tests for branch normalization, reference validation, remote validation, secret redaction, multi-hunk parsing, per-hunk resolution, bounded AI prompt scope, deterministic text anchors, review metadata validation, draft PR reuse, shell-free comment arguments, and structured-output rejection
 - Production dependency audit
 - Full dependency audit
-- Manual review of every Git invocation, Codex invocation, and user-controlled argument
+- Manual review of every Git, GitHub CLI, and Codex invocation and user-controlled argument
 - Obsidian 1.13.6 runtime verification with an existing unresolved conflict and zero console errors after a clean reload

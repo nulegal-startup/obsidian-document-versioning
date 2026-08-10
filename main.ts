@@ -1,4 +1,4 @@
-import { App, FileSystemAdapter, ItemView, Modal, Notice, Plugin, PluginSettingTab, Setting, setIcon, WorkspaceLeaf } from 'obsidian';
+import { App, Editor, FileSystemAdapter, ItemView, MarkdownView, Menu, Modal, Notice, Plugin, PluginSettingTab, Setting, setIcon, WorkspaceLeaf } from 'obsidian';
 import { simpleGit, SimpleGit, SimpleGitOptions, StatusResult } from 'simple-git';
 import { clearIntervalAsync, setIntervalAsync } from 'set-interval-async';
 import * as os from 'os';
@@ -14,6 +14,8 @@ import {
 import { CodexConflictProvider, ConflictAIProvider, ConflictAIRequest, ConflictAISuggestion } from './ai-provider';
 import { conflictEditorExtension } from './conflict-editor';
 import { ConflictHunk, parseConflictDocument } from './conflict-engine';
+import { createTextAnchor, reanchorText, TextAnchor } from './review-anchor';
+import { GitHubRepository, GitHubReviewClient, GitHubReviewComment, PullRequestInfo, parseGitHubRepository } from './github-review';
 
 type NoticeLevelSetting = 'ALL' | 'WARNING' | 'ERROR';
 type LegacyNoticeLevelSetting = NoticeLevelSetting | 'WARNINGS';
@@ -33,6 +35,8 @@ interface GHSyncSettings {
 	aiProvider: ConflictAIProvider;
 	codexExecutable: string;
 	aiConsentProvider: ConflictAIProvider;
+	githubCliPath: string;
+	autoCreateDraftPR: boolean;
 }
 
 const DEFAULT_SETTINGS: GHSyncSettings = {
@@ -49,9 +53,18 @@ const DEFAULT_SETTINGS: GHSyncSettings = {
 	aiProvider: 'disabled',
 	codexExecutable: '',
 	aiConsentProvider: 'disabled',
+	githubCliPath: '',
+	autoCreateDraftPR: true,
 };
 
 const CONFLICT_CENTER_VIEW = 'github-sync-conflict-center';
+const REVIEW_CENTER_VIEW = 'github-sync-review-center';
+
+interface ReviewSnapshot {
+	repository: GitHubRepository;
+	pull: PullRequestInfo;
+	comments: GitHubReviewComment[];
+}
 
 interface BranchSnapshot {
 	current: string;
@@ -179,6 +192,7 @@ export default class GHSyncPlugin extends Plugin {
 	private conflictedFiles = new Map<string, number>();
 	private dirtyRefreshTimer?: number;
 	private readonly gitControlEls: HTMLElement[] = [];
+	private reviewSnapshot?: ReviewSnapshot;
 
 	private shouldShowNotice(severity: NoticeSeverity): boolean {
 		switch (this.settings.noticeLevel) {
@@ -212,6 +226,38 @@ export default class GHSyncPlugin extends Plugin {
 			trimmed: false,
 		};
 		return simpleGit(options);
+	}
+
+	private getReviewClient(): GitHubReviewClient {
+		const executable = this.settings.githubCliPath.trim() || 'gh';
+		if (/[\r\n\0]/.test(executable)) throw new Error('The configured GitHub CLI path is invalid.');
+		return new GitHubReviewClient(executable);
+	}
+
+	private async ensureReview(branch?: string): Promise<ReviewSnapshot> {
+		const git = this.getGit();
+		await this.configureRemote(git);
+		const current = branch ?? await this.currentBranch(git);
+		if (current === this.getBaseBranch()) throw new Error('Start or switch to a change branch before adding review comments.');
+		const repository = parseGitHubRepository(this.settings.remoteURL);
+		const client = this.getReviewClient();
+		await client.assertAuthenticated();
+		const pull = await client.ensureDraftPR(repository, current, this.getBaseBranch());
+		const comments = await client.listComments(repository, pull.number);
+		this.reviewSnapshot = { repository, pull, comments };
+		this.refreshReviewSurfaces();
+		return this.reviewSnapshot;
+	}
+
+	private async ensureReviewAfterPush(branch: string): Promise<string | undefined> {
+		if (!this.settings.autoCreateDraftPR || branch === this.getBaseBranch()) return undefined;
+		try {
+			const snapshot = await this.ensureReview(branch);
+			return ` · review #${snapshot.pull.number}`;
+		} catch (error) {
+			this.showNotice(`Branch synced, but review setup needs attention: ${redactSensitiveText(error)}`, 'WARNING', 12000);
+			return undefined;
+		}
 	}
 
 	private getBaseBranch(): string {
@@ -357,6 +403,13 @@ export default class GHSyncPlugin extends Plugin {
 			setIcon(conflictIcon, 'git-merge');
 			conflicts.createSpan({ text: String(this.conflictedFiles.size) });
 		}
+		const unresolvedReviews = this.reviewSnapshot?.comments.filter((comment) => !comment.metadata.parentId && comment.metadata.state === 'open').length ?? 0;
+		if (unresolvedReviews > 0) {
+			const reviews = this.headerBranchBadgeEl.createSpan({ cls: 'gh-sync-header-branch__reviews' });
+			const reviewIcon = reviews.createSpan();
+			setIcon(reviewIcon, 'messages-square');
+			reviews.createSpan({ text: String(unresolvedReviews) });
+		}
 		const stateDescription = this.displayedSync ? ` ${this.displayedSync.label}.` : '';
 		const dirtyDescription = this.displayedDirty ? ' Local edits.' : '';
 		const conflictDescription = this.conflictedFiles.size > 0 ? ` ${this.conflictedFiles.size} conflicted document(s).` : '';
@@ -488,6 +541,102 @@ export default class GHSyncPlugin extends Plugin {
 		this.app.workspace.revealLeaf(leaf);
 	}
 
+	async openReviewCenter(): Promise<void> {
+		let leaf = this.app.workspace.getLeavesOfType(REVIEW_CENTER_VIEW)[0];
+		if (!leaf) {
+			leaf = this.app.workspace.getRightLeaf(false) ?? this.app.workspace.getLeaf(true);
+			await leaf.setViewState({ type: REVIEW_CENTER_VIEW, active: true });
+		}
+		await this.app.workspace.revealLeaf(leaf);
+		void this.refreshReviews();
+	}
+
+	private refreshReviewSurfaces(): void {
+		for (const leaf of this.app.workspace.getLeavesOfType(REVIEW_CENTER_VIEW)) {
+			const view = leaf.view;
+			if (view instanceof ReviewCenterView) view.refresh();
+		}
+		this.renderHeaderBranchBadge();
+	}
+
+	async refreshReviews(): Promise<void> {
+		try {
+			await this.ensureReview();
+		} catch (error) {
+			this.reviewSnapshot = undefined;
+			this.refreshReviewSurfaces();
+			for (const leaf of this.app.workspace.getLeavesOfType(REVIEW_CENTER_VIEW)) {
+				const view = leaf.view;
+				if (view instanceof ReviewCenterView) view.showError(redactSensitiveText(error));
+			}
+		}
+	}
+
+	getReviewSnapshot(): ReviewSnapshot | undefined {
+		return this.reviewSnapshot;
+	}
+
+	async commentOnSelection(editor?: Editor, markdownView?: MarkdownView): Promise<void> {
+		const view = markdownView ?? this.app.workspace.getActiveViewOfType(MarkdownView);
+		const activeEditor = editor ?? view?.editor;
+		if (!view?.file || !activeEditor) {
+			this.showNotice('Open a Markdown note and select text first.', 'WARNING');
+			return;
+		}
+		const selection = activeEditor.getSelection();
+		if (!selection) {
+			this.showNotice('Select the text you want to discuss first.', 'WARNING');
+			return;
+		}
+		try {
+			const from = activeEditor.posToOffset(activeEditor.getCursor('from'));
+			const to = activeEditor.posToOffset(activeEditor.getCursor('to'));
+			const anchor = createTextAnchor(activeEditor.getValue(), Math.min(from, to), Math.max(from, to), view.file.path);
+			const snapshot = await this.ensureReview();
+			const collaborators = await this.getReviewClient().listCollaborators(snapshot.repository);
+			new ReviewCommentModal(this.app, anchor, collaborators, async (body) => {
+				await this.getReviewClient().createComment(snapshot.repository, snapshot.pull.number, anchor, body);
+				this.showNotice(`Comment added to review #${snapshot.pull.number}.`, 'INFO');
+				await this.refreshReviews();
+				await this.openReviewCenter();
+			}).open();
+		} catch (error) {
+			this.showNotice(error, 'ERROR', 12000);
+		}
+	}
+
+	async replyToReview(comment: GitHubReviewComment): Promise<void> {
+		const snapshot = this.reviewSnapshot;
+		if (!snapshot) return;
+		const collaborators = await this.getReviewClient().listCollaborators(snapshot.repository);
+		new ReviewCommentModal(this.app, comment.metadata.anchor, collaborators, async (body) => {
+			await this.getReviewClient().createComment(snapshot.repository, snapshot.pull.number, comment.metadata.anchor, body, comment.id);
+			await this.refreshReviews();
+		}).open();
+	}
+
+	async setReviewResolved(comment: GitHubReviewComment, resolved: boolean): Promise<void> {
+		const snapshot = this.reviewSnapshot;
+		if (!snapshot) return;
+		try {
+			await this.getReviewClient().setResolved(snapshot.repository, snapshot.pull.number, comment, resolved);
+			await this.refreshReviews();
+		} catch (error) {
+			this.showNotice(error, 'ERROR', 12000);
+		}
+	}
+
+	async openReviewComment(comment: GitHubReviewComment): Promise<void> {
+		await this.app.workspace.openLinkText(comment.metadata.anchor.path, '', true);
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (view) {
+			const position = reanchorText(view.editor.getValue(), comment.metadata.anchor);
+			const line = Math.max(0, position.startLine - 1);
+			view.editor.setCursor({ line, ch: 0 });
+			view.editor.scrollIntoView({ from: { line, ch: 0 }, to: { line, ch: 0 } }, true);
+		}
+	}
+
 	private async openConflictWorkspace(files: string[]): Promise<void> {
 		if (files.length === 0) return;
 		await this.openConflictFile(files[0]);
@@ -595,8 +744,10 @@ export default class GHSyncPlugin extends Plugin {
 
 			progress.step(`Pushing ${branch} to GitHub`);
 			await git.push('origin', branch, ['-u']);
+			progress.step('Preparing documentation review');
+			const review = await this.ensureReviewAfterPush(branch);
 			await this.updateBranchStatus(git, describeBranchSync(0, 0, true));
-			return { status: 'success', message: `Synced ${branch}` };
+			return { status: 'success', message: `Synced ${branch}${review ?? ''}` };
 		}, this.settings.showSyncSuccessNotice);
 	}
 
@@ -681,8 +832,10 @@ export default class GHSyncPlugin extends Plugin {
 
 			progress.step(`Publishing ${newBranch} to GitHub`);
 			await git.push('origin', newBranch, ['-u']);
+			progress.step('Preparing documentation review');
+			const review = await this.ensureReviewAfterPush(newBranch);
 			await this.updateBranchStatus(git, describeBranchSync(0, 0, true));
-			return { status: 'success', message: `Started change: ${newBranch}` };
+			return { status: 'success', message: `Started change: ${newBranch}${review ?? ''}` };
 		});
 	}
 
@@ -795,6 +948,7 @@ export default class GHSyncPlugin extends Plugin {
 	async onload(): Promise<void> {
 		await this.loadSettings();
 		this.registerView(CONFLICT_CENTER_VIEW, (leaf) => new ConflictCenterView(leaf, this));
+		this.registerView(REVIEW_CENTER_VIEW, (leaf) => new ReviewCenterView(leaf, this));
 		this.registerEditorExtension(conflictEditorExtension({
 			isConflictedFile: (filePath) => this.isConflictedFile(filePath),
 			onDocumentUpdated: (filePath, remaining) => this.onConflictDocumentUpdated(filePath, remaining),
@@ -822,6 +976,13 @@ export default class GHSyncPlugin extends Plugin {
 			window.setTimeout(() => this.renderHeaderBranchBadge(), 0);
 		}));
 		this.registerEvent(this.app.workspace.on('layout-change', () => this.renderHeaderBranchBadge()));
+		this.registerEvent(this.app.workspace.on('editor-menu', (menu: Menu, editor: Editor, info) => {
+			if (!editor.getSelection()) return;
+			menu.addItem((item) => item
+				.setTitle('Comment on selection')
+				.setIcon('message-square-plus')
+				.onClick(() => void this.commentOnSelection(editor, info instanceof MarkdownView ? info : undefined)));
+		}));
 		this.registerEvent(this.app.vault.on('modify', () => {
 			if (this.dirtyRefreshTimer) window.clearTimeout(this.dirtyRefreshTimer);
 			this.dirtyRefreshTimer = window.setTimeout(() => {
@@ -835,12 +996,26 @@ export default class GHSyncPlugin extends Plugin {
 			if (!this.syncInProgress) this.openBranchManager();
 		});
 		branchRibbonEl.addClass('gh-sync-branch-ribbon');
+		const reviewRibbonEl = this.addRibbonIcon('messages-square', 'Open documentation review', () => {
+			if (!this.syncInProgress) void this.openReviewCenter();
+		});
+		reviewRibbonEl.addClass('gh-sync-review-ribbon');
 		this.gitControlEls.push(ribbonIconEl, branchRibbonEl);
 
 		this.addCommand({ id: 'github-sync-command', name: 'Sync current branch', callback: () => void this.syncNotes() });
 		this.addCommand({ id: 'github-sync-update-current', name: 'Update current branch from GitHub', callback: () => void this.updateCurrentBranch() });
 		this.addCommand({ id: 'github-sync-branch-manager', name: 'Open branch manager', callback: () => this.openBranchManager() });
 		this.addCommand({ id: 'github-sync-conflict-center', name: 'Open conflict center', callback: () => void this.openConflictCenter() });
+		this.addCommand({ id: 'github-sync-review-center', name: 'Open review center', callback: () => void this.openReviewCenter() });
+		this.addCommand({
+			id: 'github-sync-comment-selection',
+			name: 'Comment on selected text',
+			editorCheckCallback: (checking, editor, view) => {
+				if (!editor.getSelection()) return false;
+				if (!checking) void this.commentOnSelection(editor, view instanceof MarkdownView ? view : undefined);
+				return true;
+			},
+		});
 		this.addCommand({
 			id: 'github-sync-start-change',
 			name: 'Start a change branch',
@@ -935,6 +1110,162 @@ class ConflictCenterView extends ItemView {
 		const footer = this.contentEl.createDiv({ cls: 'gh-sync-conflict-center__footer' });
 		footer.createEl('p', { text: 'AI suggestions are optional and never apply changes automatically.' });
 	}
+}
+
+class ReviewCenterView extends ItemView {
+	private error?: string;
+
+	constructor(leaf: WorkspaceLeaf, private readonly plugin: GHSyncPlugin) {
+		super(leaf);
+	}
+
+	getViewType(): string { return REVIEW_CENTER_VIEW; }
+	getDisplayText(): string { return 'Documentation review'; }
+	getIcon(): string { return 'messages-square'; }
+
+	async onOpen(): Promise<void> {
+		this.refresh();
+	}
+
+	showError(message: string): void {
+		this.error = message;
+		this.refresh();
+	}
+
+	refresh(): void {
+		this.contentEl.empty();
+		this.contentEl.addClass('gh-sync-review-center');
+		const header = this.contentEl.createDiv({ cls: 'gh-sync-review-center__header' });
+		const heading = header.createDiv();
+		heading.createEl('h3', { text: 'Documentation review' });
+		heading.createEl('p', { text: 'Selected-text discussions on the current change branch.' });
+		const refresh = header.createEl('button', { cls: 'clickable-icon', attr: { type: 'button', 'aria-label': 'Refresh review comments' } });
+		setIcon(refresh, 'refresh-cw');
+		refresh.addEventListener('click', () => {
+			this.error = undefined;
+			void this.plugin.refreshReviews();
+		});
+
+		const snapshot = this.plugin.getReviewSnapshot();
+		if (!snapshot) {
+			const empty = this.contentEl.createDiv({ cls: 'gh-sync-review-center__empty' });
+			const icon = empty.createSpan();
+			setIcon(icon, this.error ? 'circle-alert' : 'loader-circle');
+			empty.createDiv({ cls: 'gh-sync-review-center__empty-title', text: this.error ? 'Review setup needed' : 'Loading review…' });
+			empty.createEl('p', { text: this.error ?? 'Checking the draft pull request for this branch.' });
+			if (this.error) empty.createEl('p', { text: 'Install and sign in to GitHub CLI, then refresh. Your Git branch sync still works independently.' });
+			return;
+		}
+
+		this.error = undefined;
+		const roots = snapshot.comments.filter((comment) => !comment.metadata.parentId);
+		const unresolved = roots.filter((comment) => comment.metadata.state === 'open').length;
+		const summary = this.contentEl.createDiv({ cls: 'gh-sync-review-center__summary' });
+		summary.createSpan({ text: `Review #${snapshot.pull.number}` });
+		summary.createSpan({ cls: unresolved > 0 ? 'is-open' : 'is-resolved', text: unresolved > 0 ? `${unresolved} open` : 'All resolved' });
+
+		if (roots.length === 0) {
+			const empty = this.contentEl.createDiv({ cls: 'gh-sync-review-center__empty' });
+			const icon = empty.createSpan();
+			setIcon(icon, 'message-square-plus');
+			empty.createDiv({ cls: 'gh-sync-review-center__empty-title', text: 'No discussions yet' });
+			empty.createEl('p', { text: 'Select text in a note, right-click, and choose “Comment on selection”.' });
+			return;
+		}
+
+		const list = this.contentEl.createDiv({ cls: 'gh-sync-review-center__list' });
+		for (const comment of roots) {
+			const thread = list.createDiv({ cls: `gh-sync-review-thread${comment.metadata.state === 'resolved' ? ' is-resolved' : ''}` });
+			const top = thread.createDiv({ cls: 'gh-sync-review-thread__top' });
+			const location = top.createEl('button', { cls: 'gh-sync-review-thread__location', attr: { type: 'button' } });
+			setIcon(location.createSpan(), 'file-text');
+			location.createSpan({ text: `${comment.metadata.anchor.path} · lines ${comment.metadata.anchor.startLine}–${comment.metadata.anchor.endLine}` });
+			location.addEventListener('click', () => void this.plugin.openReviewComment(comment));
+			top.createSpan({ cls: `gh-sync-review-thread__state${comment.metadata.state === 'resolved' ? ' is-resolved' : ''}`, text: comment.metadata.state === 'resolved' ? 'Resolved' : 'Open' });
+
+			const quote = thread.createEl('blockquote', { text: comment.metadata.anchor.selectedText.slice(0, 500) });
+			if (comment.metadata.anchor.selectedText.length > 500) quote.createSpan({ text: '…' });
+			const body = thread.createDiv({ cls: 'gh-sync-review-thread__body', text: comment.body.replace(/^(?:>.*\n?)+\s*/m, '') });
+			body.setAttr('data-author', `@${comment.author}`);
+			thread.createDiv({ cls: 'gh-sync-review-thread__meta', text: `@${comment.author} · ${new Date(comment.createdAt).toLocaleString()}` });
+
+			for (const reply of snapshot.comments.filter((candidate) => candidate.metadata.parentId === comment.id)) {
+				const replyEl = thread.createDiv({ cls: 'gh-sync-review-thread__reply' });
+				replyEl.createDiv({ cls: 'gh-sync-review-thread__reply-meta', text: `@${reply.author} · ${new Date(reply.createdAt).toLocaleString()}` });
+				replyEl.createDiv({ text: reply.body });
+			}
+
+			const actions = thread.createDiv({ cls: 'gh-sync-review-thread__actions' });
+			const reply = actions.createEl('button', { text: 'Reply', attr: { type: 'button' } });
+			reply.addEventListener('click', () => void this.plugin.replyToReview(comment));
+			const resolve = actions.createEl('button', { text: comment.metadata.state === 'resolved' ? 'Reopen' : 'Resolve', attr: { type: 'button' } });
+			resolve.addEventListener('click', () => void this.plugin.setReviewResolved(comment, comment.metadata.state !== 'resolved'));
+		}
+	}
+}
+
+class ReviewCommentModal extends Modal {
+	private body = '';
+	private submitting = false;
+
+	constructor(
+		app: App,
+		private readonly anchor: TextAnchor,
+		private readonly collaborators: string[],
+		private readonly submit: (body: string) => Promise<void>,
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		this.modalEl.addClass('gh-sync-review-modal');
+		this.contentEl.createEl('h2', { text: 'Comment on selected text' });
+		this.contentEl.createDiv({ cls: 'gh-sync-review-modal__location', text: `${this.anchor.path} · lines ${this.anchor.startLine}–${this.anchor.endLine}` });
+		this.contentEl.createEl('blockquote', { text: this.anchor.selectedText.slice(0, 1000) });
+		const textarea = this.contentEl.createEl('textarea', {
+			cls: 'gh-sync-review-modal__input',
+			attr: { placeholder: 'Add context or a decision. Type @ to notify a collaborator.', rows: '6', maxlength: '20000' },
+		});
+		textarea.addEventListener('input', () => this.body = textarea.value);
+		const people = this.contentEl.createDiv({ cls: 'gh-sync-review-modal__people' });
+		people.createSpan({ text: 'Mention: ' });
+		for (const collaborator of this.collaborators.slice(0, 12)) {
+			const button = people.createEl('button', { text: `@${collaborator}`, attr: { type: 'button' } });
+			button.addEventListener('click', () => {
+				const mention = `@${collaborator} `;
+				textarea.setRangeText(mention, textarea.selectionStart, textarea.selectionEnd, 'end');
+				this.body = textarea.value;
+				textarea.focus();
+			});
+		}
+		const status = this.contentEl.createDiv({ cls: 'gh-sync-review-modal__status', attr: { 'aria-live': 'polite' } });
+		const actions = this.contentEl.createDiv({ cls: 'gh-sync-review-modal__actions' });
+		const cancel = actions.createEl('button', { text: 'Cancel', attr: { type: 'button' } });
+		cancel.addEventListener('click', () => this.close());
+		const post = actions.createEl('button', { cls: 'mod-cta', text: 'Post comment', attr: { type: 'button' } });
+		post.addEventListener('click', async () => {
+			if (this.submitting || !this.body.trim()) {
+				if (!this.body.trim()) status.setText('Write a comment before posting.');
+				return;
+			}
+			this.submitting = true;
+			post.disabled = true;
+			cancel.disabled = true;
+			status.setText('Posting to GitHub…');
+			try {
+				await this.submit(this.body);
+				this.close();
+			} catch (error) {
+				status.setText(redactSensitiveText(error));
+				this.submitting = false;
+				post.disabled = false;
+				cancel.disabled = false;
+			}
+		});
+		window.setTimeout(() => textarea.focus(), 0);
+	}
+
+	onClose(): void { this.contentEl.empty(); }
 }
 
 class AIConsentModal extends Modal {
@@ -1160,6 +1491,31 @@ class GHSyncSettingTab extends PluginSettingTab {
 				this.plugin.settings.gitLocation = value;
 				await this.plugin.saveSettings();
 			}));
+
+		containerEl.createEl('h3', { text: 'Selected-text reviews' });
+		containerEl.createEl('p', {
+			cls: 'setting-item-description',
+			text: 'Comments are stored on the change branch’s draft GitHub pull request. GitHub accounts and the authenticated GitHub CLI provide identity, mentions, and notifications.',
+		});
+
+		new Setting(containerEl)
+			.setName('Create draft review automatically')
+			.setDesc('Create or reuse a draft pull request after publishing a change branch. A review setup error never prevents Git synchronization.')
+			.addToggle((toggle) => toggle.setValue(this.plugin.settings.autoCreateDraftPR).onChange(async (value) => {
+				this.plugin.settings.autoCreateDraftPR = value;
+				await this.plugin.saveSettings();
+			}));
+
+		new Setting(containerEl)
+			.setName('GitHub CLI executable')
+			.setDesc('Optional full path to gh. Leave empty when the GitHub CLI is on PATH.')
+			.addText((text) => text
+				.setPlaceholder('/opt/homebrew/bin/gh')
+				.setValue(this.plugin.settings.githubCliPath)
+				.onChange(async (value) => {
+					this.plugin.settings.githubCliPath = value;
+					await this.plugin.saveSettings();
+				}));
 
 		containerEl.createEl('h3', { text: 'Conflict suggestions' });
 		containerEl.createEl('p', {

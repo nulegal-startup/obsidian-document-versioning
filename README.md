@@ -24,6 +24,9 @@ This fork adds a non-technical, branch-based documentation workflow to Kevin Chi
 - Pause on merge conflicts and show each conflicting section directly in the note.
 - Keep a workspace-wide Conflict Center with document and section counts.
 - Offer review-only Codex, Ollama, or LM Studio suggestions for one conflict at a time.
+- Create or reuse a draft GitHub pull request when a change branch is published.
+- Attach selected-text comments to that review without changing the Markdown document.
+- Support collaborator mentions, replies, resolve/reopen, and a workspace Review Center.
 - Prevent overlapping manual, startup, and scheduled Git operations.
 - Reject credential-bearing remote URLs and redact common GitHub tokens from errors.
 
@@ -33,7 +36,7 @@ This fork adds a non-technical, branch-based documentation workflow to Kevin Chi
 2. Enter a short change name, such as `Next sprint billing`.
 3. Edit notes normally in Obsidian.
 4. Choose **GitHub Sync: Sync current branch** or click the GitHub ribbon icon.
-5. Open a pull request on GitHub when the change is ready for review.
+5. Select text and use **Comment on selected text** when a decision needs discussion; the draft review is created automatically.
 6. After the pull request is merged, use **Return to main** in the branch manager.
 
 The branch manager also lists existing local and GitHub branches. Switching is allowed only when the current branch is clean and synchronized, preventing uncommitted edits from being silently carried between changes.
@@ -55,6 +58,8 @@ Your Obsidian vault must already be a Git repository with an `origin` remote. Co
 - **Protect base branch:** keep enabled to prevent direct commits to `main`.
 - **Change branch prefix:** normally `changes`.
 - **Git binary location:** leave empty when Git is available on your system path.
+- **Create draft review automatically:** keep enabled to connect each published change branch to one draft pull request.
+- **GitHub CLI executable:** leave empty when `gh` is on `PATH`; run `gh auth login` once on each editor's computer.
 - **AI provider:** optional; disabled by default. Codex uses the local Codex CLI login, while Ollama and LM Studio use a local model server through the Codex CLI.
 - **Codex executable:** optional full path; leave empty to use the ChatGPT app copy or `codex` on `PATH`.
 
@@ -66,6 +71,14 @@ git@github.com:your-organization/docs.git
 ```
 
 Do not embed a GitHub token in the remote URL. Use SSH or Git Credential Manager.
+
+## Selected-text review behavior
+
+Select text in a Markdown note and use the editor context menu or command palette action **Comment on selected text**. The plugin records a deterministic text anchor (file, line range, selected text, and bounded surrounding context) in hidden metadata on the branch's draft pull request. The Markdown file itself remains unchanged.
+
+The **Documentation review** side panel groups replies into threads and lets editors navigate back to the note, reply, resolve, or reopen a discussion. `@mentions` use GitHub identities and normal GitHub notifications. If the selected wording moves, the bounded context lets the plugin re-identify it; if it is deleted, the thread remains available in the Review Center as historical discussion.
+
+Review comments require a GitHub account with repository access and an authenticated GitHub CLI. The plugin never stores a GitHub token. Failure to create or refresh a review does not block Git commits, pulls, or pushes.
 
 ## Conflict behavior
 
@@ -105,6 +118,7 @@ Then reload Obsidian and enable **GitHub Sync** under Community Plugins.
 - The plugin settings file should remain ignored if you maintain a custom Obsidian configuration policy.
 - AI conflict suggestions are disabled by default. The first request to a selected provider discloses the exact data scope and requires consent.
 - The AI subprocess uses argument arrays instead of a shell, an isolated temporary directory, a read-only Codex sandbox, ephemeral sessions, bounded input, and a strict JSON output schema.
+- GitHub review requests also use argument arrays without a shell; comment content is bounded and credentials are delegated to the GitHub CLI.
 - Production dependencies and the development toolchain are checked with `npm audit`.
 
 See [SECURITY_REVIEW.md](SECURITY_REVIEW.md) for the focused review performed for this fork.
