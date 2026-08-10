@@ -1,6 +1,6 @@
 # Security Review
 
-Review scope: branch workflow fork of Obsidian GitHub Sync, including Git command construction, vault changes, remote configuration, credentials, dependencies, and conflict behavior.
+Review scope: branch workflow fork of Obsidian GitHub Sync, including Git command construction, vault changes, remote configuration, credentials, dependencies, conflict behavior, and optional AI conflict suggestions.
 
 ## Resolved findings
 
@@ -32,6 +32,18 @@ The original `git add ./*` did not reliably include deletions or hidden files. S
 
 Branch names are generated from a restricted slug and validated as Git references. Base branches and branch prefixes are also validated. Remote URLs are restricted to HTTPS and SSH and reject control characters.
 
+### High — AI subprocess and document data exposure
+
+AI suggestions are disabled by default and run only after the user clicks the suggestion action. The first request for a selected provider shows the exact data scope and requires consent. Requests include one conflict, bounded nearby context, the file path, and branch name; the rest of the vault is not included. Document content is explicitly delimited as untrusted data to reduce prompt-injection risk.
+
+The Codex process is started with an argument array and no shell. It uses an isolated temporary directory, ephemeral mode, ignored repository rules and user configuration, a read-only sandbox, no approval prompts, a strict JSON output schema, bounded output, and a timeout. Temporary files use owner-only permissions and are removed in a `finally` block. Provider errors redact common GitHub and OpenAI token forms.
+
+AI output is never written, staged, committed, or pushed automatically. The user must review and apply it. A content-derived conflict identifier rejects stale suggestions when the underlying conflict changes during inference.
+
+### Medium — conflict resolution could stage unintended content
+
+Raw conflict ranges are parsed deterministically and resolved one section at a time. **Mark resolved** refuses to stage while any complete conflict marker remains, rechecks Git's conflicted-file list, and stages only the explicitly selected path using `git add -- <path>`. File paths are normalized and prevented from escaping the vault.
+
 ## Residual risks
 
 - The plugin executes the Git binary configured by the local user. A malicious person who can alter Obsidian plugin settings already has access equivalent to that desktop user.
@@ -39,11 +51,14 @@ Branch names are generated from a restricted slug and validated as Git reference
 - The plugin commits all non-ignored vault changes. Repository owners must maintain an appropriate `.gitignore` and avoid storing secrets in notes.
 - Git provides asynchronous collaboration, not live co-editing. Simultaneous changes to the same lines can still require human conflict resolution.
 - Pull-request creation and merge authorization remain on GitHub and are not implemented in this plugin.
+- Codex may send the selected conflict to OpenAI under the user's configured Codex account. Ollama and LM Studio keep inference local only when the user's local provider configuration does so. Users remain responsible for provider data-retention and model policies.
+- Delimiting note content reduces prompt-injection risk but cannot guarantee that every model ignores adversarial document text. Suggestions remain untrusted until reviewed.
 
 ## Verification
 
 - TypeScript production build
-- Unit tests for branch normalization, reference validation, remote validation, and secret redaction
+- Unit tests for branch normalization, reference validation, remote validation, secret redaction, multi-hunk parsing, per-hunk resolution, bounded AI prompt scope, and structured-output rejection
 - Production dependency audit
 - Full dependency audit
-- Manual review of every Git invocation and all user-controlled arguments
+- Manual review of every Git invocation, Codex invocation, and user-controlled argument
+- Obsidian 1.13.6 runtime verification with an existing unresolved conflict and zero console errors after a clean reload

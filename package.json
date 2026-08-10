@@ -1,6 +1,6 @@
 {
 	"name": "github-sync",
-	"version": "1.6.0",
+	"version": "1.7.0",
 	"author": "NuLegal",
 	"description": "Sync an Obsidian vault through safe, branch-based documentation changes.",
 	"main": "main.js",
@@ -13,6 +13,8 @@
 	"keywords": [],
 	"license": "MIT",
 	"devDependencies": {
+		"@codemirror/state": "^6.7.1",
+		"@codemirror/view": "^6.43.8",
 		"@types/node": "^16.11.6",
 		"@typescript-eslint/eslint-plugin": "5.29.0",
 		"@typescript-eslint/parser": "5.29.0",

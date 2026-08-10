@@ -1,4 +1,4 @@
-import { App, FileSystemAdapter, Modal, Notice, Plugin, PluginSettingTab, Setting, setIcon } from 'obsidian';
+import { App, FileSystemAdapter, ItemView, Modal, Notice, Plugin, PluginSettingTab, Setting, setIcon, WorkspaceLeaf } from 'obsidian';
 import { simpleGit, SimpleGit, SimpleGitOptions, StatusResult } from 'simple-git';
 import { clearIntervalAsync, setIntervalAsync } from 'set-interval-async';
 import * as os from 'os';
@@ -6,13 +6,14 @@ import * as path from 'path';
 import {
 	BranchSyncSummary,
 	describeBranchSync,
-	GitConflictVersions,
 	isSafeBranchRef,
 	normalizeBranchName,
-	parseGitConflict,
 	redactSensitiveText,
 	validateRemoteUrl,
 } from './branch-utils';
+import { CodexConflictProvider, ConflictAIProvider, ConflictAIRequest, ConflictAISuggestion } from './ai-provider';
+import { conflictEditorExtension } from './conflict-editor';
+import { ConflictHunk, parseConflictDocument } from './conflict-engine';
 
 type NoticeLevelSetting = 'ALL' | 'WARNING' | 'ERROR';
 type LegacyNoticeLevelSetting = NoticeLevelSetting | 'WARNINGS';
@@ -29,6 +30,9 @@ interface GHSyncSettings {
 	checkStatusOnLoad: boolean;
 	noticeLevel: NoticeLevelSetting;
 	showSyncSuccessNotice: boolean;
+	aiProvider: ConflictAIProvider;
+	codexExecutable: string;
+	aiConsentProvider: ConflictAIProvider;
 }
 
 const DEFAULT_SETTINGS: GHSyncSettings = {
@@ -42,7 +46,12 @@ const DEFAULT_SETTINGS: GHSyncSettings = {
 	checkStatusOnLoad: true,
 	noticeLevel: 'ALL',
 	showSyncSuccessNotice: true,
+	aiProvider: 'disabled',
+	codexExecutable: '',
+	aiConsentProvider: 'disabled',
 };
+
+const CONFLICT_CENTER_VIEW = 'github-sync-conflict-center';
 
 interface BranchSnapshot {
 	current: string;
@@ -167,7 +176,7 @@ export default class GHSyncPlugin extends Plugin {
 	private displayedBranch?: string;
 	private displayedSync?: BranchSyncSummary;
 	private displayedDirty = false;
-	private conflictResolverOpen = false;
+	private conflictedFiles = new Map<string, number>();
 	private dirtyRefreshTimer?: number;
 	private readonly gitControlEls: HTMLElement[] = [];
 
@@ -279,7 +288,9 @@ export default class GHSyncPlugin extends Plugin {
 		try {
 			const gitInstance = git ?? this.getGit();
 			const branch = await this.currentBranch(gitInstance);
-			this.displayedDirty = !(await gitInstance.status()).isClean();
+			const status = await gitInstance.status();
+			this.displayedDirty = !status.isClean();
+			await this.setConflictFiles(status.conflicted);
 			if (branch !== this.displayedBranch && !sync) this.displayedSync = undefined;
 			this.displayedBranch = branch;
 			if (sync) this.displayedSync = sync;
@@ -294,9 +305,13 @@ export default class GHSyncPlugin extends Plugin {
 				});
 			}
 			if (this.displayedDirty) this.branchStatusEl.createSpan({ cls: 'gh-sync-status__dirty', text: '●' });
+			if (this.conflictedFiles.size > 0) {
+				this.branchStatusEl.createSpan({ cls: 'gh-sync-status__conflicts', text: `${this.conflictedFiles.size} conflict${this.conflictedFiles.size === 1 ? '' : 's'}` });
+			}
 			const stateDescription = this.displayedSync ? ` ${this.displayedSync.label}.` : '';
 			const dirtyDescription = this.displayedDirty ? ' Local edits.' : '';
-			this.branchStatusEl.setAttr('title', `Current documentation branch: ${branch}.${stateDescription}${dirtyDescription}`);
+			const conflictDescription = this.conflictedFiles.size > 0 ? ` ${this.conflictedFiles.size} conflicted document(s).` : '';
+			this.branchStatusEl.setAttr('title', `Current documentation branch: ${branch}.${stateDescription}${dirtyDescription}${conflictDescription}`);
 			this.branchStatusEl.setAttr('aria-busy', 'false');
 			this.renderHeaderBranchBadge();
 		} catch {
@@ -316,7 +331,10 @@ export default class GHSyncPlugin extends Plugin {
 			badge.type = 'button';
 			badge.addClass('gh-sync-header-branch');
 			this.registerDomEvent(badge, 'click', () => {
-				if (!this.syncInProgress) this.openBranchManager();
+				if (!this.syncInProgress) {
+					if (this.conflictedFiles.size > 0) void this.openConflictCenter();
+					else this.openBranchManager();
+				}
 			});
 			this.headerBranchBadgeEl = badge;
 			this.register(() => badge.remove());
@@ -333,10 +351,17 @@ export default class GHSyncPlugin extends Plugin {
 			});
 		}
 		if (this.displayedDirty) this.headerBranchBadgeEl.createSpan({ cls: 'gh-sync-header-branch__dirty', text: '●' });
+		if (this.conflictedFiles.size > 0) {
+			const conflicts = this.headerBranchBadgeEl.createSpan({ cls: 'gh-sync-header-branch__conflicts' });
+			const conflictIcon = conflicts.createSpan();
+			setIcon(conflictIcon, 'git-merge');
+			conflicts.createSpan({ text: String(this.conflictedFiles.size) });
+		}
 		const stateDescription = this.displayedSync ? ` ${this.displayedSync.label}.` : '';
 		const dirtyDescription = this.displayedDirty ? ' Local edits.' : '';
-		this.headerBranchBadgeEl.setAttr('title', `Current documentation branch: ${this.displayedBranch}.${stateDescription}${dirtyDescription} Click to manage branches.`);
-		this.headerBranchBadgeEl.setAttr('aria-label', `Current documentation branch: ${this.displayedBranch}.${stateDescription}${dirtyDescription} Open branch manager.`);
+		const conflictDescription = this.conflictedFiles.size > 0 ? ` ${this.conflictedFiles.size} conflicted document(s).` : '';
+		this.headerBranchBadgeEl.setAttr('title', `Current documentation branch: ${this.displayedBranch}.${stateDescription}${dirtyDescription}${conflictDescription} Click to manage branches.`);
+		this.headerBranchBadgeEl.setAttr('aria-label', `Current documentation branch: ${this.displayedBranch}.${stateDescription}${dirtyDescription}${conflictDescription} Open branch manager.`);
 		const actions = header.querySelector('.view-actions');
 		if (actions) header.insertBefore(this.headerBranchBadgeEl, actions);
 		else header.appendChild(this.headerBranchBadgeEl);
@@ -414,34 +439,108 @@ export default class GHSyncPlugin extends Plugin {
 		return resolved;
 	}
 
-	async getConflictVersions(file: string): Promise<GitConflictVersions> {
-		const safePath = this.safeConflictPath(file);
-		const text = await this.app.vault.adapter.read(safePath);
-		return parseGitConflict(text);
+	getConflictFiles(): Array<{ path: string; unresolved: number }> {
+		return Array.from(this.conflictedFiles, ([filePath, unresolved]) => ({ path: filePath, unresolved }))
+			.sort((left, right) => left.path.localeCompare(right.path));
 	}
 
-	async resolveConflictFile(file: string, choice: 'current' | 'incoming'): Promise<void> {
+	isConflictedFile(filePath: string): boolean {
+		return this.conflictedFiles.has(filePath.replace(/\\/g, '/'));
+	}
+
+	private async setConflictFiles(files: string[]): Promise<void> {
+		const next = new Map<string, number>();
+		for (const file of files) {
+			const safePath = this.safeConflictPath(file);
+			let count = 0;
+			try {
+				count = parseConflictDocument(await this.app.vault.adapter.read(safePath)).hunks.length;
+			} catch {
+				count = 1;
+			}
+			next.set(safePath, count);
+		}
+		const changed = JSON.stringify(Array.from(this.conflictedFiles)) !== JSON.stringify(Array.from(next));
+		this.conflictedFiles = next;
+		if (changed) this.refreshConflictSurfaces();
+	}
+
+	private refreshConflictSurfaces(): void {
+		this.renderHeaderBranchBadge();
+		for (const leaf of this.app.workspace.getLeavesOfType(CONFLICT_CENTER_VIEW)) {
+			const view = leaf.view;
+			if (view instanceof ConflictCenterView) view.refresh();
+		}
+		this.app.workspace.updateOptions();
+	}
+
+	async openConflictFile(file: string): Promise<void> {
+		await this.app.workspace.openLinkText(this.safeConflictPath(file), '', true);
+	}
+
+	async openConflictCenter(): Promise<void> {
+		let leaf = this.app.workspace.getLeavesOfType(CONFLICT_CENTER_VIEW)[0];
+		if (!leaf) {
+			leaf = this.app.workspace.getRightLeaf(false);
+			if (!leaf) return;
+			await leaf.setViewState({ type: CONFLICT_CENTER_VIEW, active: true });
+		}
+		this.app.workspace.revealLeaf(leaf);
+	}
+
+	private async openConflictWorkspace(files: string[]): Promise<void> {
+		if (files.length === 0) return;
+		await this.openConflictFile(files[0]);
+		await this.openConflictCenter();
+	}
+
+	onConflictDocumentUpdated(filePath: string, remaining: number): void {
+		if (!this.conflictedFiles.has(filePath)) return;
+		this.conflictedFiles.set(filePath, remaining);
+		this.refreshConflictSurfaces();
+	}
+
+	async markConflictResolved(file: string, text: string): Promise<void> {
 		const safePath = this.safeConflictPath(file);
-		const versions = await this.getConflictVersions(safePath);
+		if (parseConflictDocument(text).hunks.length > 0) {
+			throw new Error('Review every conflicting section before marking this document resolved.');
+		}
 		const git = this.getGit();
 		const status = await git.status();
 		const conflictPaths = status.conflicted.map((conflictPath) => conflictPath.replace(/\\/g, '/'));
-		if (!conflictPaths.includes(safePath)) throw new Error(`${safePath} is no longer marked as conflicted.`);
-		await this.app.vault.adapter.write(safePath, choice === 'current' ? versions.current : versions.incoming);
+		if (!conflictPaths.includes(safePath)) {
+			this.conflictedFiles.delete(safePath);
+			this.refreshConflictSurfaces();
+			return;
+		}
+		await this.app.vault.adapter.write(safePath, text);
 		await git.raw(['add', '--', safePath]);
+		await this.setConflictFiles((await git.status()).conflicted);
 		await this.updateBranchStatus(git);
+		this.showNotice(`${safePath} is resolved. Continue Sync current when all documents are ready.`, 'INFO');
 	}
 
-	openConflictFileManually(file: string): void {
-		this.app.workspace.openLinkText(this.safeConflictPath(file), '', true);
+	aiProviderLabel(): string | null {
+		if (this.settings.aiProvider === 'disabled') return null;
+		if (this.settings.aiProvider === 'codex') return 'Codex';
+		return this.settings.aiProvider === 'ollama' ? 'Ollama' : 'LM Studio';
 	}
 
-	private openConflictResolver(files: string[]): void {
-		if (this.conflictResolverOpen || files.length === 0) return;
-		this.conflictResolverOpen = true;
-		new ConflictResolutionModal(this.app, this, files, () => {
-			this.conflictResolverOpen = false;
-		}).open();
+	async requestAISuggestion(request: Omit<ConflictAIRequest, 'branch'>): Promise<ConflictAISuggestion> {
+		const provider = this.settings.aiProvider;
+		if (provider === 'disabled') throw new Error('Enable an AI provider in GitHub Sync settings first.');
+		if (this.settings.aiConsentProvider !== provider) {
+			const approved = await new Promise<boolean>((resolve) => new AIConsentModal(this.app, provider, resolve).open());
+			if (!approved) throw new Error('AI suggestion cancelled.');
+			this.settings.aiConsentProvider = provider;
+			await this.saveSettings();
+		}
+		const git = this.getGit();
+		const branch = await this.currentBranch(git);
+		return new CodexConflictProvider({
+			provider,
+			executable: this.settings.codexExecutable,
+		}).suggest({ ...request, branch });
 	}
 
 	private async handleConflicts(git: SimpleGit, pullError: unknown): Promise<string> {
@@ -450,8 +549,9 @@ export default class GHSyncPlugin extends Plugin {
 		if (conflicts.length === 0) {
 			throw new Error(`Git could not merge the remote changes. No files were pushed.\n${redactSensitiveText(pullError)}`);
 		}
-		this.openConflictResolver(conflicts);
-		return `Sync paused for ${conflicts.length} conflicted document${conflicts.length === 1 ? '' : 's'}. The conflict resolver is open.`;
+		await this.setConflictFiles(conflicts);
+		await this.openConflictWorkspace(conflicts);
+		return `Sync paused for ${conflicts.length} conflicted document${conflicts.length === 1 ? '' : 's'}. Review the highlighted sections in the editor.`;
 	}
 
 	async syncNotes(showBranchManagerOnProtected = true): Promise<void> {
@@ -464,10 +564,11 @@ export default class GHSyncPlugin extends Plugin {
 			const status = await git.status();
 			const branch = await this.currentBranch(git);
 			if (status.conflicted.length > 0) {
-				this.openConflictResolver(status.conflicted);
+				await this.setConflictFiles(status.conflicted);
+				await this.openConflictWorkspace(status.conflicted);
 				return {
 					status: 'warning',
-					message: `Sync paused for ${status.conflicted.length} conflicted document${status.conflicted.length === 1 ? '' : 's'}. The conflict resolver is open.`,
+					message: `Sync paused for ${status.conflicted.length} conflicted document${status.conflicted.length === 1 ? '' : 's'}. Review the highlighted sections in the editor.`,
 				};
 			}
 			if (this.settings.protectBaseBranch && branch === this.getBaseBranch() && !status.isClean()) {
@@ -654,8 +755,8 @@ export default class GHSyncPlugin extends Plugin {
 			const git = this.getGit();
 			const status = await git.status();
 			if (status.conflicted.length > 0) {
+				await this.setConflictFiles(status.conflicted);
 				await this.updateBranchStatus(git);
-				this.openConflictResolver(status.conflicted);
 				return;
 			}
 			await this.configureRemote(git);
@@ -693,11 +794,29 @@ export default class GHSyncPlugin extends Plugin {
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
+		this.registerView(CONFLICT_CENTER_VIEW, (leaf) => new ConflictCenterView(leaf, this));
+		this.registerEditorExtension(conflictEditorExtension({
+			isConflictedFile: (filePath) => this.isConflictedFile(filePath),
+			onDocumentUpdated: (filePath, remaining) => this.onConflictDocumentUpdated(filePath, remaining),
+			markResolved: async (filePath, text) => {
+				try {
+					await this.markConflictResolved(filePath, text);
+				} catch (error) {
+					this.showNotice(error, 'ERROR', 12000);
+				}
+			},
+			openConflictCenter: () => void this.openConflictCenter(),
+			requestAISuggestion: (filePath, hunk, before, after) => this.requestAISuggestion({ filePath, hunk, before, after }),
+			aiProviderLabel: () => this.aiProviderLabel(),
+		}));
 		this.branchStatusEl = this.addStatusBarItem();
 		this.branchStatusEl.addClass('gh-sync-status');
 		this.branchStatusEl.setAttr('aria-live', 'polite');
 		this.registerDomEvent(this.branchStatusEl, 'click', () => {
-			if (!this.syncInProgress) this.openBranchManager();
+			if (!this.syncInProgress) {
+				if (this.conflictedFiles.size > 0) void this.openConflictCenter();
+				else this.openBranchManager();
+			}
 		});
 		this.registerEvent(this.app.workspace.on('active-leaf-change', () => {
 			window.setTimeout(() => this.renderHeaderBranchBadge(), 0);
@@ -721,6 +840,7 @@ export default class GHSyncPlugin extends Plugin {
 		this.addCommand({ id: 'github-sync-command', name: 'Sync current branch', callback: () => void this.syncNotes() });
 		this.addCommand({ id: 'github-sync-update-current', name: 'Update current branch from GitHub', callback: () => void this.updateCurrentBranch() });
 		this.addCommand({ id: 'github-sync-branch-manager', name: 'Open branch manager', callback: () => this.openBranchManager() });
+		this.addCommand({ id: 'github-sync-conflict-center', name: 'Open conflict center', callback: () => void this.openConflictCenter() });
 		this.addCommand({
 			id: 'github-sync-start-change',
 			name: 'Start a change branch',
@@ -753,132 +873,107 @@ export default class GHSyncPlugin extends Plugin {
 	}
 }
 
-class ConflictResolutionModal extends Modal {
-	private index = 0;
-	private resolving = false;
+class ConflictCenterView extends ItemView {
+	constructor(leaf: WorkspaceLeaf, private readonly plugin: GHSyncPlugin) {
+		super(leaf);
+	}
+
+	getViewType(): string {
+		return CONFLICT_CENTER_VIEW;
+	}
+
+	getDisplayText(): string {
+		return 'Conflict center';
+	}
+
+	getIcon(): string {
+		return 'git-merge';
+	}
+
+	async onOpen(): Promise<void> {
+		this.refresh();
+	}
+
+	refresh(): void {
+		this.contentEl.empty();
+		this.contentEl.addClass('gh-sync-conflict-center');
+		const header = this.contentEl.createDiv({ cls: 'gh-sync-conflict-center__header' });
+		const heading = header.createDiv();
+		heading.createEl('h3', { text: 'Conflict center' });
+		heading.createEl('p', { text: 'Documents paused during the GitHub sync.' });
+		const files = this.plugin.getConflictFiles();
+		if (files.length === 0) {
+			const empty = this.contentEl.createDiv({ cls: 'gh-sync-conflict-center__empty' });
+			const icon = empty.createSpan();
+			setIcon(icon, 'circle-check');
+			empty.createDiv({ cls: 'gh-sync-conflict-center__empty-title', text: 'No unresolved conflicts' });
+			empty.createEl('p', { text: 'Your documentation branch is ready for normal editing.' });
+			return;
+		}
+
+		const total = files.reduce((sum, file) => sum + file.unresolved, 0);
+		this.contentEl.createDiv({
+			cls: 'gh-sync-conflict-center__summary',
+			text: total > 0
+				? `${total} section${total === 1 ? '' : 's'} across ${files.length} document${files.length === 1 ? '' : 's'}`
+				: `${files.length} document${files.length === 1 ? '' : 's'} ready to mark resolved`,
+		});
+		const list = this.contentEl.createDiv({ cls: 'gh-sync-conflict-center__list' });
+		for (const file of files) {
+			const item = list.createEl('button', { cls: 'gh-sync-conflict-center__item', attr: { type: 'button' } });
+			const icon = item.createSpan({ cls: 'gh-sync-conflict-center__item-icon' });
+			setIcon(icon, file.unresolved > 0 ? 'file-warning' : 'circle-check');
+			const copy = item.createDiv({ cls: 'gh-sync-conflict-center__item-copy' });
+			copy.createDiv({ cls: 'gh-sync-conflict-center__item-name', text: file.path.split('/').pop() || file.path });
+			copy.createDiv({ cls: 'gh-sync-conflict-center__item-path', text: file.path });
+			item.createSpan({
+				cls: `gh-sync-conflict-center__count${file.unresolved === 0 ? ' is-ready' : ''}`,
+				text: file.unresolved > 0 ? String(file.unresolved) : 'Ready',
+			});
+			item.addEventListener('click', () => void this.plugin.openConflictFile(file.path));
+		}
+		const footer = this.contentEl.createDiv({ cls: 'gh-sync-conflict-center__footer' });
+		footer.createEl('p', { text: 'AI suggestions are optional and never apply changes automatically.' });
+	}
+}
+
+class AIConsentModal extends Modal {
+	private resolved = false;
 
 	constructor(
 		app: App,
-		private readonly plugin: GHSyncPlugin,
-		private readonly files: string[],
-		private readonly onDismiss: () => void,
+		private readonly provider: Exclude<ConflictAIProvider, 'disabled'>,
+		private readonly resolve: (approved: boolean) => void,
 	) {
 		super(app);
 	}
 
 	onOpen(): void {
-		this.modalEl.addClass('gh-sync-conflict-modal');
-		void this.render();
-	}
-
-	private async render(): Promise<void> {
-		this.contentEl.empty();
-		const file = this.files[this.index];
-		this.contentEl.createEl('h2', { text: 'Resolve documentation conflict' });
-		this.contentEl.createDiv({
-			cls: 'gh-sync-conflict-modal__progress',
-			text: `Document ${this.index + 1} of ${this.files.length}`,
-		});
+		this.modalEl.addClass('gh-sync-ai-consent');
+		const label = this.provider === 'codex' ? 'Codex' : this.provider === 'ollama' ? 'Ollama' : 'LM Studio';
+		this.contentEl.createEl('h2', { text: `Use ${label} for this conflict?` });
 		this.contentEl.createEl('p', {
-			cls: 'gh-sync-conflict-modal__intro',
-			text: 'Both versions changed the same part of this document. Review them and choose the complete version to keep.',
+			text: this.provider === 'codex'
+				? 'The conflicting text, nearby context, file path, and branch name will be sent to your configured Codex account.'
+				: `The conflicting text, nearby context, file path, and branch name will be sent to your local ${label} server.`,
 		});
-		this.contentEl.createDiv({ cls: 'gh-sync-conflict-modal__file', text: file });
-
-		const loading = this.contentEl.createDiv({ cls: 'gh-sync-conflict-modal__loading', text: 'Preparing both versions…' });
-		try {
-			const versions = await this.plugin.getConflictVersions(file);
-			loading.remove();
-			this.renderVersions(file, versions);
-		} catch (error) {
-			loading.setText(redactSensitiveText(error));
-			loading.addClass('is-error');
-			this.renderManualAction(file);
-		}
-	}
-
-	private renderVersions(file: string, versions: GitConflictVersions): void {
-		const comparison = this.contentEl.createDiv({ cls: 'gh-sync-conflict-comparison' });
-		this.createVersionCard(comparison, 'Current branch', 'Your local version before the GitHub update.', versions.current, 'current');
-		this.createVersionCard(comparison, 'GitHub version', 'The incoming version from the remote branch.', versions.incoming, 'incoming');
-
-		const summary = this.contentEl.createDiv({ cls: 'gh-sync-conflict-modal__summary' });
-		summary.createSpan({ text: `${versions.conflictCount} conflicting section${versions.conflictCount === 1 ? '' : 's'} in this document.` });
-		summary.createSpan({ text: ' Choosing a side resolves every conflicting section in this file.' });
-		this.renderManualAction(file);
-	}
-
-	private createVersionCard(
-		parent: HTMLElement,
-		title: string,
-		description: string,
-		value: string,
-		choice: 'current' | 'incoming',
-	): void {
-		const card = parent.createDiv({ cls: `gh-sync-conflict-version is-${choice}` });
-		const header = card.createDiv({ cls: 'gh-sync-conflict-version__header' });
-		header.createEl('h3', { text: title });
-		header.createEl('p', { text: description });
-		const preview = card.createEl('textarea', { cls: 'gh-sync-conflict-version__preview' });
-		preview.value = value;
-		preview.readOnly = true;
-		preview.spellcheck = false;
-		preview.setAttr('aria-label', `${title} document preview`);
-		const button = card.createEl('button', {
-			cls: 'gh-sync-conflict-version__choose',
-			text: choice === 'current' ? 'Keep current version' : 'Use GitHub version',
-		});
-		button.addEventListener('click', () => void this.chooseVersion(choice));
-	}
-
-	private renderManualAction(file: string): void {
-		const footer = this.contentEl.createDiv({ cls: 'gh-sync-conflict-modal__footer' });
-		const manual = footer.createEl('button', { text: 'Open manual editor' });
-		manual.addEventListener('click', () => {
-			this.close();
-			this.plugin.openConflictFileManually(file);
-		});
-	}
-
-	private async chooseVersion(choice: 'current' | 'incoming'): Promise<void> {
-		if (this.resolving) return;
-		this.resolving = true;
-		for (const button of Array.from(this.contentEl.querySelectorAll('button'))) {
-			if (button instanceof HTMLButtonElement) button.disabled = true;
-		}
-		try {
-			await this.plugin.resolveConflictFile(this.files[this.index], choice);
-			this.index += 1;
-			if (this.index < this.files.length) await this.render();
-			else this.renderComplete();
-		} catch (error) {
-			this.resolving = false;
-			new Notice(redactSensitiveText(error), 10000);
-			await this.render();
-		}
-		this.resolving = false;
-	}
-
-	private renderComplete(): void {
-		this.contentEl.empty();
-		const icon = this.contentEl.createDiv({ cls: 'gh-sync-conflict-complete__icon' });
-		setIcon(icon, 'circle-check');
-		this.contentEl.createEl('h2', { text: 'Conflicts resolved' });
-		this.contentEl.createEl('p', {
-			text: `Resolved ${this.files.length} document${this.files.length === 1 ? '' : 's'}. Continue syncing to commit the resolution and push the branch.`,
-		});
-		const footer = this.contentEl.createDiv({ cls: 'gh-sync-conflict-modal__footer' });
-		const later = footer.createEl('button', { text: 'Finish later' });
-		later.addEventListener('click', () => this.close());
-		const continueButton = footer.createEl('button', { cls: 'mod-cta', text: 'Continue sync' });
+		const safeguards = this.contentEl.createEl('ul');
+		safeguards.createEl('li', { text: 'The rest of your vault is not included.' });
+		safeguards.createEl('li', { text: 'The provider runs read-only in an isolated temporary folder.' });
+		safeguards.createEl('li', { text: 'You must review and apply every suggestion yourself.' });
+		const actions = this.contentEl.createDiv({ cls: 'gh-sync-ai-consent__actions' });
+		const cancel = actions.createEl('button', { text: 'Cancel', attr: { type: 'button' } });
+		cancel.addEventListener('click', () => this.close());
+		const continueButton = actions.createEl('button', { cls: 'mod-cta', text: `Allow ${label}`, attr: { type: 'button' } });
 		continueButton.addEventListener('click', () => {
+			this.resolved = true;
+			this.resolve(true);
 			this.close();
-			void this.plugin.syncNotes();
 		});
 	}
 
 	onClose(): void {
-		this.onDismiss();
+		if (!this.resolved) this.resolve(false);
 		this.contentEl.empty();
 	}
 }
@@ -1065,6 +1160,42 @@ class GHSyncSettingTab extends PluginSettingTab {
 				this.plugin.settings.gitLocation = value;
 				await this.plugin.saveSettings();
 			}));
+
+		containerEl.createEl('h3', { text: 'Conflict suggestions' });
+		containerEl.createEl('p', {
+			cls: 'setting-item-description',
+			text: 'AI is optional. Suggestions are read-only and must be reviewed before they can replace a conflicting section.',
+		});
+
+		new Setting(containerEl)
+			.setName('AI provider')
+			.setDesc('Codex uses your local Codex CLI login. Ollama and LM Studio use the Codex CLI with a local model server.')
+			.addDropdown((dropdown) => dropdown
+				.addOption('disabled', 'Disabled')
+				.addOption('codex', 'Codex')
+				.addOption('ollama', 'Ollama (local)')
+				.addOption('lmstudio', 'LM Studio (local)')
+				.setValue(this.plugin.settings.aiProvider)
+				.onChange(async (value: ConflictAIProvider) => {
+					this.plugin.settings.aiProvider = value;
+					this.plugin.settings.aiConsentProvider = 'disabled';
+					await this.plugin.saveSettings();
+					this.plugin.app.workspace.updateOptions();
+					this.display();
+				}));
+
+		if (this.plugin.settings.aiProvider !== 'disabled') {
+			new Setting(containerEl)
+				.setName('Codex executable')
+				.setDesc('Optional full path to the Codex executable. Leave empty to use the ChatGPT app copy or codex on PATH.')
+				.addText((text) => text
+					.setPlaceholder('/Applications/ChatGPT.app/Contents/Resources/codex')
+					.setValue(this.plugin.settings.codexExecutable)
+					.onChange(async (value) => {
+						this.plugin.settings.codexExecutable = value;
+						await this.plugin.saveSettings();
+					}));
+		}
 
 		new Setting(containerEl)
 			.setName('Notice level')

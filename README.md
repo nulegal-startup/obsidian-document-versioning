@@ -21,7 +21,9 @@ This fork adds a non-technical, branch-based documentation workflow to Kevin Chi
 - Fast-forward clean remote-only updates through an explicit **Update branch** action.
 - Require **Sync current** when local edits or commits must be saved, merged, or pushed.
 - Refuse to switch branches when local or remote work is not synchronized.
-- Pause on merge conflicts and open a guided, side-by-side document resolver.
+- Pause on merge conflicts and show each conflicting section directly in the note.
+- Keep a workspace-wide Conflict Center with document and section counts.
+- Offer review-only Codex, Ollama, or LM Studio suggestions for one conflict at a time.
 - Prevent overlapping manual, startup, and scheduled Git operations.
 - Reject credential-bearing remote URLs and redact common GitHub tokens from errors.
 
@@ -53,6 +55,8 @@ Your Obsidian vault must already be a Git repository with an `origin` remote. Co
 - **Protect base branch:** keep enabled to prevent direct commits to `main`.
 - **Change branch prefix:** normally `changes`.
 - **Git binary location:** leave empty when Git is available on your system path.
+- **AI provider:** optional; disabled by default. Codex uses the local Codex CLI login, while Ollama and LM Studio use a local model server through the Codex CLI.
+- **Codex executable:** optional full path; leave empty to use the ChatGPT app copy or `codex` on `PATH`.
 
 Examples of accepted remotes:
 
@@ -68,13 +72,15 @@ Do not embed a GitHub token in the remote URL. Use SSH or Git Credential Manager
 The plugin automatically merges non-overlapping changes. If Git reports a conflict, the plugin:
 
 - does not push;
-- opens each conflicting document in a guided resolver;
-- restores the resolver automatically when Obsidian starts with an unfinished conflict;
-- shows the complete current-branch and GitHub versions without raw Git markers;
-- lets the user explicitly keep either complete version, or open the note for manual editing; and
-- stages the selected resolution, then waits for **Continue sync** before committing or pushing.
+- opens the first affected note and the workspace-wide **Conflict Center** after a user-triggered sync;
+- shows persistent conflict counts without opening a surprise modal on startup;
+- replaces raw Git markers with a side-by-side review block for each conflicting section;
+- lets the user keep the current text, keep the GitHub text, keep both, or edit the final wording;
+- optionally asks Codex, Ollama, or LM Studio for a structured suggestion that remains review-only;
+- rejects an AI response if the underlying conflict changed while the provider was working; and
+- stages a document only after every section is reviewed and the user clicks **Mark resolved**.
 
-It never silently selects one version of a conflicted note.
+It never silently selects one version, applies AI text, stages a document, commits, or pushes a conflict resolution.
 
 ## Installation for development
 
@@ -97,6 +103,8 @@ Then reload Obsidian and enable **GitHub Sync** under Community Plugins.
 - This is a desktop-only plugin because it invokes the local Git executable.
 - The vault's `.gitignore` should exclude private files that must never reach the documentation repository.
 - The plugin settings file should remain ignored if you maintain a custom Obsidian configuration policy.
+- AI conflict suggestions are disabled by default. The first request to a selected provider discloses the exact data scope and requires consent.
+- The AI subprocess uses argument arrays instead of a shell, an isolated temporary directory, a read-only Codex sandbox, ephemeral sessions, bounded input, and a strict JSON output schema.
 - Production dependencies and the development toolchain are checked with `npm audit`.
 
 See [SECURITY_REVIEW.md](SECURITY_REVIEW.md) for the focused review performed for this fork.
