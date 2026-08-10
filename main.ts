@@ -148,6 +148,8 @@ export default class GHSyncPlugin extends Plugin {
 	private syncInProgress = false;
 	private syncTimer?: ReturnType<typeof setIntervalAsync>;
 	private branchStatusEl?: HTMLElement;
+	private headerBranchBadgeEl?: HTMLButtonElement;
+	private displayedBranch?: string;
 	private readonly gitControlEls: HTMLElement[] = [];
 
 	private shouldShowNotice(severity: NoticeSeverity): boolean {
@@ -252,13 +254,46 @@ export default class GHSyncPlugin extends Plugin {
 		if (!this.branchStatusEl) return;
 		try {
 			const branch = await this.currentBranch(git ?? this.getGit());
+			this.displayedBranch = branch;
 			this.branchStatusEl.empty();
-			this.branchStatusEl.setText(`Git: ${branch}`);
+			const icon = this.branchStatusEl.createSpan({ cls: 'gh-sync-status__icon' });
+			setIcon(icon, 'git-branch');
+			this.branchStatusEl.createSpan({ text: branch });
 			this.branchStatusEl.setAttr('title', `Current documentation branch: ${branch}`);
 			this.branchStatusEl.setAttr('aria-busy', 'false');
+			this.renderHeaderBranchBadge();
 		} catch {
 			this.branchStatusEl.setText('Git: unavailable');
 		}
+	}
+
+	private renderHeaderBranchBadge(): void {
+		if (!this.displayedBranch) return;
+		const leaf = this.app.workspace.getMostRecentLeaf();
+		const titleContainer = leaf?.view.containerEl.querySelector('.view-header-title-container');
+		const header = titleContainer?.closest('.view-header');
+		if (!(header instanceof HTMLElement)) return;
+
+		if (!this.headerBranchBadgeEl) {
+			const badge = document.createElement('button');
+			badge.type = 'button';
+			badge.addClass('gh-sync-header-branch');
+			this.registerDomEvent(badge, 'click', () => {
+				if (!this.syncInProgress) this.openBranchManager();
+			});
+			this.headerBranchBadgeEl = badge;
+			this.register(() => badge.remove());
+		}
+
+		this.headerBranchBadgeEl.empty();
+		const icon = this.headerBranchBadgeEl.createSpan({ cls: 'gh-sync-header-branch__icon' });
+		setIcon(icon, 'git-branch');
+		this.headerBranchBadgeEl.createSpan({ cls: 'gh-sync-header-branch__label', text: this.displayedBranch });
+		this.headerBranchBadgeEl.setAttr('title', `Current documentation branch: ${this.displayedBranch}. Click to manage branches.`);
+		this.headerBranchBadgeEl.setAttr('aria-label', `Current documentation branch: ${this.displayedBranch}. Open branch manager.`);
+		const actions = header.querySelector('.view-actions');
+		if (actions) header.insertBefore(this.headerBranchBadgeEl, actions);
+		else header.appendChild(this.headerBranchBadgeEl);
 	}
 
 	private setOperationStatus(step?: string): void {
@@ -523,6 +558,10 @@ export default class GHSyncPlugin extends Plugin {
 		this.registerDomEvent(this.branchStatusEl, 'click', () => {
 			if (!this.syncInProgress) this.openBranchManager();
 		});
+		this.registerEvent(this.app.workspace.on('active-leaf-change', () => {
+			window.setTimeout(() => this.renderHeaderBranchBadge(), 0);
+		}));
+		this.registerEvent(this.app.workspace.on('layout-change', () => this.renderHeaderBranchBadge()));
 
 		const ribbonIconEl = this.addRibbonIcon('github', 'Sync current branch', () => void this.syncNotes());
 		ribbonIconEl.addClass('gh-sync-ribbon');

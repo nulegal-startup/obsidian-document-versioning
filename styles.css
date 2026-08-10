@@ -23,18 +23,24 @@
 .gh-sync-status {
   order: -1;
   align-items: center;
+  background-color: var(--background-secondary-alt);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 999px;
   display: inline-flex;
-  gap: 5px;
+  gap: 6px;
+  margin-block: 2px;
   max-width: min(360px, 40vw);
   overflow: hidden;
+  padding: 1px 8px;
   text-overflow: ellipsis;
   white-space: nowrap;
-  transition-property: color, background-color;
+  transition-property: color, background-color, border-color;
   transition-duration: 150ms;
   transition-timing-function: ease-out;
 }
 
 .gh-sync-status[aria-busy="true"] {
+  border-color: var(--interactive-accent);
   color: var(--text-accent);
   cursor: progress;
   font-variant-numeric: tabular-nums;
@@ -52,8 +58,65 @@
   width: 13px;
 }
 
+.gh-sync-status__icon,
+.gh-sync-header-branch__icon {
+  align-items: center;
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
+.gh-sync-status__icon svg,
+.gh-sync-header-branch__icon svg {
+  height: 13px;
+  width: 13px;
+}
+
+.gh-sync-header-branch {
+  align-items: center;
+  appearance: none;
+  background-color: var(--background-secondary-alt);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 999px;
+  color: var(--text-accent);
+  cursor: pointer;
+  display: inline-flex;
+  flex: 0 0 auto;
+  font-family: var(--font-interface);
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--font-medium);
+  gap: 6px;
+  height: 28px;
+  margin-inline-start: 10px;
+  max-width: min(260px, 32vw);
+  min-width: 40px;
+  padding: 0 10px;
+  transition-property: color, background-color, border-color, box-shadow, transform;
+  transition-duration: 150ms;
+  transition-timing-function: ease-out;
+}
+
+.gh-sync-header-branch:hover {
+  background-color: var(--background-modifier-hover);
+  border-color: var(--interactive-accent);
+}
+
+.gh-sync-header-branch:focus-visible {
+  border-color: var(--interactive-accent);
+  box-shadow: 0 0 0 2px var(--background-modifier-border-focus);
+  outline: none;
+}
+
+.gh-sync-header-branch:active {
+  transform: scale(0.97);
+}
+
+.gh-sync-header-branch__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .notice.gh-sync-operation {
-  background: var(--background-primary);
   border: 1px solid var(--background-modifier-border);
   border-radius: 12px;
   box-shadow: 0 12px 32px rgb(0 0 0 / 18%), 0 2px 8px rgb(0 0 0 / 10%);
@@ -62,6 +125,16 @@
   overflow: hidden;
   padding: 14px;
   width: 360px;
+}
+
+body.theme-light .notice.gh-sync-operation {
+  background-color: var(--background-primary);
+  box-shadow: 0 12px 32px rgb(0 0 0 / 14%), 0 2px 8px rgb(0 0 0 / 8%);
+}
+
+body.theme-dark .notice.gh-sync-operation {
+  background-color: var(--background-secondary);
+  box-shadow: 0 14px 36px rgb(0 0 0 / 38%), 0 2px 10px rgb(0 0 0 / 24%);
 }
 
 .gh-sync-operation__header {
@@ -132,12 +205,16 @@
 
 .gh-sync-operation__step-icon {
   align-items: center;
-  background: var(--background-primary);
+  background-color: var(--background-primary);
   display: inline-flex;
   flex: 0 0 auto;
   justify-content: center;
   margin-left: -21px;
   margin-top: 1px;
+}
+
+body.theme-dark .gh-sync-operation__step-icon {
+  background-color: var(--background-secondary);
 }
 
 .gh-sync-operation__step-icon svg {
@@ -215,12 +292,14 @@
 
   .gh-sync-ribbon,
   .gh-sync-branch-ribbon,
+  .gh-sync-header-branch,
   .gh-sync-operation__step {
     transition-duration: 0ms;
   }
 
   .gh-sync-ribbon:active,
-  .gh-sync-branch-ribbon:active {
+  .gh-sync-branch-ribbon:active,
+  .gh-sync-header-branch:active {
     transform: none;
   }
 }

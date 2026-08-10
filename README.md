@@ -15,6 +15,8 @@ This fork adds a non-technical, branch-based documentation workflow to Kevin Chi
 - Show a live operation timeline while Git is checking, fetching, merging, switching, or pushing.
 - Mirror the current operation in the status bar and temporarily disable conflicting ribbon actions.
 - Keep errors and action-needed states visible long enough to understand what happened.
+- Follow Obsidian's live light/dark appearance when its base color scheme adapts to the system.
+- Show the current branch as a clickable badge in the active note header and status bar.
 - Refuse to switch branches when local or remote work is not synchronized.
 - Stop on merge conflicts and open each conflicting note for resolution.
 - Prevent overlapping manual, startup, and scheduled Git operations.
