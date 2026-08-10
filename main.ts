@@ -3,6 +3,7 @@ import { simpleGit, SimpleGit, SimpleGitOptions, StatusResult } from 'simple-git
 import { clearIntervalAsync, setIntervalAsync } from 'set-interval-async';
 import * as os from 'os';
 import * as path from 'path';
+import * as fs from 'fs';
 import {
 	BranchSyncSummary,
 	describeBranchSync,
@@ -229,7 +230,9 @@ export default class GHSyncPlugin extends Plugin {
 	}
 
 	private getReviewClient(): GitHubReviewClient {
-		const executable = this.settings.githubCliPath.trim() || 'gh';
+		const configured = this.settings.githubCliPath.trim();
+		const homebrewExecutable = ['/opt/homebrew/bin/gh', '/usr/local/bin/gh'].find((candidate) => fs.existsSync(candidate));
+		const executable = configured || homebrewExecutable || 'gh';
 		if (/[\r\n\0]/.test(executable)) throw new Error('The configured GitHub CLI path is invalid.');
 		return new GitHubReviewClient(executable);
 	}
