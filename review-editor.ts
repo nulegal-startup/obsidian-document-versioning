@@ -15,7 +15,6 @@ class SelectionCommentControl {
 		this.button.type = 'button';
 		this.button.className = 'gh-sync-selection-comment';
 		this.button.setAttribute('aria-label', 'Comment on selected text');
-		this.button.setAttribute('title', 'Comment on selected text');
 		const icon = this.button.createSpan({ cls: 'gh-sync-selection-comment__icon' });
 		setIcon(icon, 'message-square-plus');
 		this.button.createSpan({ text: 'Comment' });

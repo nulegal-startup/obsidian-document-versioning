@@ -1114,7 +1114,11 @@
   transform: translateY(0) scale(1);
 }
 
-.gh-sync-selection-comment:hover { background: var(--background-modifier-hover); }
+.gh-sync-selection-comment:hover {
+  background: var(--background-secondary);
+  border-color: var(--background-modifier-border-hover, var(--interactive-accent));
+  box-shadow: 0 3px 7px rgba(0, 0, 0, .16), 0 10px 28px rgba(0, 0, 0, .14);
+}
 .gh-sync-selection-comment:active { transform: scale(.96); }
 
 .gh-sync-selection-comment__icon,
