@@ -1,4 +1,4 @@
-import { App, FileSystemAdapter, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { App, FileSystemAdapter, Modal, Notice, Plugin, PluginSettingTab, Setting, setIcon } from 'obsidian';
 import { simpleGit, SimpleGit, SimpleGitOptions, StatusResult } from 'simple-git';
 import { clearIntervalAsync, setIntervalAsync } from 'set-interval-async';
 import * as os from 'os';
@@ -41,11 +41,114 @@ interface BranchSnapshot {
 	branches: string[];
 }
 
+type OperationResult = {
+	status: 'success' | 'warning';
+	message: string;
+};
+
+class GitOperationProgress {
+	private readonly notice: Notice;
+	private readonly noticeEl: HTMLElement;
+	private readonly titleEl: HTMLElement;
+	private readonly iconEl: HTMLElement;
+	private readonly stepsEl: HTMLElement;
+	private activeStepEl?: HTMLElement;
+	private finished = false;
+
+	constructor(
+		title: string,
+		private readonly onStep: (step: string) => void,
+		private readonly onFinish: () => void,
+	) {
+		this.notice = new Notice('', 0);
+		this.noticeEl = this.notice.noticeEl;
+		this.noticeEl.empty();
+		this.noticeEl.addClass('gh-sync-operation');
+		this.noticeEl.setAttr('role', 'status');
+		this.noticeEl.setAttr('aria-live', 'polite');
+
+		const header = this.noticeEl.createDiv({ cls: 'gh-sync-operation__header' });
+		this.iconEl = header.createSpan({ cls: 'gh-sync-operation__icon gh-sync-operation__spinner' });
+		setIcon(this.iconEl, 'loader-circle');
+		this.titleEl = header.createDiv({ cls: 'gh-sync-operation__title', text: title });
+		this.stepsEl = this.noticeEl.createDiv({ cls: 'gh-sync-operation__steps' });
+		this.noticeEl.createDiv({
+			cls: 'gh-sync-operation__hint',
+			text: 'Working in the background — keep Obsidian open.',
+		});
+	}
+
+	step(label: string): void {
+		if (this.finished) return;
+		if (this.activeStepEl) {
+			this.activeStepEl.removeClass('is-active');
+			this.activeStepEl.addClass('is-complete');
+			const previousIcon = this.activeStepEl.querySelector('.gh-sync-operation__step-icon');
+			if (previousIcon instanceof HTMLElement) setIcon(previousIcon, 'check');
+		}
+
+		const stepEl = this.stepsEl.createDiv({ cls: 'gh-sync-operation__step is-active' });
+		const iconEl = stepEl.createSpan({ cls: 'gh-sync-operation__step-icon' });
+		setIcon(iconEl, 'circle');
+		stepEl.createSpan({ cls: 'gh-sync-operation__step-label', text: label });
+		this.activeStepEl = stepEl;
+		this.onStep(label);
+	}
+
+	complete(result: OperationResult, showSuccess = true): void {
+		if (this.finished) return;
+		this.finished = true;
+		this.finishActiveStep();
+		this.noticeEl.removeClass('is-warning');
+		this.noticeEl.addClass(result.status === 'success' ? 'is-success' : 'is-warning');
+		this.iconEl.removeClass('gh-sync-operation__spinner');
+		setIcon(this.iconEl, result.status === 'success' ? 'circle-check' : 'circle-alert');
+		this.titleEl.setText(result.status === 'success' ? 'Operation complete' : 'Action needed');
+		this.replaceHint(result.message);
+		this.onFinish();
+		const timeout = result.status === 'success' && !showSuccess ? 350 : result.status === 'success' ? 4000 : 10000;
+		window.setTimeout(() => this.notice.hide(), timeout);
+	}
+
+	fail(error: unknown): void {
+		if (this.finished) return;
+		this.finished = true;
+		this.noticeEl.addClass('is-error');
+		this.noticeEl.setAttr('aria-live', 'assertive');
+		this.iconEl.removeClass('gh-sync-operation__spinner');
+		setIcon(this.iconEl, 'circle-x');
+		this.titleEl.setText('Operation failed');
+		if (this.activeStepEl) {
+			this.activeStepEl.removeClass('is-active');
+			this.activeStepEl.addClass('is-error');
+			const icon = this.activeStepEl.querySelector('.gh-sync-operation__step-icon');
+			if (icon instanceof HTMLElement) setIcon(icon, 'x');
+		}
+		this.replaceHint(redactSensitiveText(error));
+		this.onFinish();
+		window.setTimeout(() => this.notice.hide(), 15000);
+	}
+
+	private finishActiveStep(): void {
+		if (!this.activeStepEl) return;
+		this.activeStepEl.removeClass('is-active');
+		this.activeStepEl.addClass('is-complete');
+		const icon = this.activeStepEl.querySelector('.gh-sync-operation__step-icon');
+		if (icon instanceof HTMLElement) setIcon(icon, 'check');
+	}
+
+	private replaceHint(message: string): void {
+		const hint = this.noticeEl.querySelector('.gh-sync-operation__hint');
+		if (hint instanceof HTMLElement) hint.setText(message);
+	}
+}
+
 export default class GHSyncPlugin extends Plugin {
 	settings: GHSyncSettings;
 	private syncInProgress = false;
 	private syncTimer?: ReturnType<typeof setIntervalAsync>;
 	private branchStatusEl?: HTMLElement;
+	private readonly gitControlEls: HTMLElement[] = [];
 
 	private shouldShowNotice(severity: NoticeSeverity): boolean {
 		switch (this.settings.noticeLevel) {
@@ -149,21 +252,56 @@ export default class GHSyncPlugin extends Plugin {
 		if (!this.branchStatusEl) return;
 		try {
 			const branch = await this.currentBranch(git ?? this.getGit());
+			this.branchStatusEl.empty();
 			this.branchStatusEl.setText(`Git: ${branch}`);
 			this.branchStatusEl.setAttr('title', `Current documentation branch: ${branch}`);
+			this.branchStatusEl.setAttr('aria-busy', 'false');
 		} catch {
 			this.branchStatusEl.setText('Git: unavailable');
 		}
 	}
 
-	private async withGitLock(action: () => Promise<void>): Promise<void> {
+	private setOperationStatus(step?: string): void {
+		for (const control of this.gitControlEls) {
+			control.toggleClass('is-busy', Boolean(step));
+			control.setAttr('aria-disabled', String(Boolean(step)));
+		}
+		if (!this.branchStatusEl) return;
+		this.branchStatusEl.empty();
+		if (!step) {
+			void this.updateBranchStatus();
+			return;
+		}
+		const spinner = this.branchStatusEl.createSpan({ cls: 'gh-sync-status__spinner' });
+		setIcon(spinner, 'loader-circle');
+		this.branchStatusEl.createSpan({ text: step });
+		this.branchStatusEl.setAttr('title', step);
+		this.branchStatusEl.setAttr('aria-busy', 'true');
+	}
+
+	private createProgress(title: string): GitOperationProgress {
+		return new GitOperationProgress(
+			title,
+			(step) => this.setOperationStatus(step),
+			() => this.setOperationStatus(),
+		);
+	}
+
+	private async withGitLock(
+		title: string,
+		action: (progress: GitOperationProgress) => Promise<OperationResult>,
+		showSuccess = true,
+	): Promise<void> {
 		if (this.syncInProgress) {
 			this.showNotice('A Git operation is already running.', 'WARNING');
 			return;
 		}
 		this.syncInProgress = true;
+		const progress = this.createProgress(title);
 		try {
-			await action();
+			progress.complete(await action(progress), showSuccess);
+		} catch (error) {
+			progress.fail(error);
 		} finally {
 			this.syncInProgress = false;
 		}
@@ -185,161 +323,172 @@ export default class GHSyncPlugin extends Plugin {
 		return true;
 	}
 
-	private async showConflicts(git: SimpleGit, pullError: unknown): Promise<void> {
+	private async conflictError(git: SimpleGit, pullError: unknown): Promise<Error> {
 		const status = await git.status();
 		const conflicts = status.conflicted;
 		if (conflicts.length === 0) {
-			this.showNotice(`Git could not merge the remote changes. No files were pushed.\n${redactSensitiveText(pullError)}`, 'ERROR', 10000);
-			return;
+			return new Error(`Git could not merge the remote changes. No files were pushed.\n${redactSensitiveText(pullError)}`);
 		}
-		this.showNotice(`Merge conflicts must be resolved before syncing:\n${conflicts.join('\n')}`, 'WARNING', 15000);
 		for (const file of conflicts) {
 			this.app.workspace.openLinkText('', file, true);
 		}
+		return new Error(`Merge conflicts must be resolved before syncing:\n${conflicts.join('\n')}`);
 	}
 
 	async syncNotes(showBranchManagerOnProtected = true): Promise<void> {
-		await this.withGitLock(async () => {
-			try {
-				const git = this.getGit();
-				await git.status();
-				await this.configureRemote(git);
-				const status = await git.status();
-				const branch = await this.currentBranch(git);
-				if (this.settings.protectBaseBranch && branch === this.getBaseBranch() && !status.isClean()) {
-					this.showNotice(`${branch} is protected. Start or switch to a change branch before syncing edited files.`, 'WARNING', 10000);
-					if (showBranchManagerOnProtected) this.openBranchManager();
-					return;
-				}
-				await this.commitLocalChanges(git, status);
-				await git.fetch('origin');
+		await this.withGitLock('Syncing documentation', async (progress) => {
+			progress.step('Preparing repository');
+			const git = this.getGit();
+			await this.configureRemote(git);
 
-				if (await this.remoteBranchExists(git, branch)) {
-					try {
-						await git.pull('origin', branch, { '--no-rebase': null });
-					} catch (error) {
-						await this.showConflicts(git, error);
-						return;
-					}
-				}
-
-				await git.push('origin', branch, ['-u']);
-				await this.updateBranchStatus(git);
-				if (this.settings.showSyncSuccessNotice) {
-					this.showNotice(`Synced ${branch}`, 'INFO');
-				}
-			} catch (error) {
-				this.showNotice(error, 'ERROR', 10000);
+			progress.step('Checking the current branch');
+			const status = await git.status();
+			const branch = await this.currentBranch(git);
+			if (this.settings.protectBaseBranch && branch === this.getBaseBranch() && !status.isClean()) {
+				if (showBranchManagerOnProtected) this.openBranchManager();
+				return {
+					status: 'warning',
+					message: `${branch} is protected. Start or switch to a change branch before syncing edited files.`,
+				};
 			}
-		});
+
+			progress.step(status.isClean() ? 'No local edits to save' : 'Saving local edits');
+			await this.commitLocalChanges(git, status);
+
+			progress.step('Fetching updates from GitHub');
+			await git.fetch('origin');
+			if (await this.remoteBranchExists(git, branch)) {
+				progress.step(`Merging updates into ${branch}`);
+				try {
+					await git.pull('origin', branch, { '--no-rebase': null });
+				} catch (error) {
+					throw await this.conflictError(git, error);
+				}
+			}
+
+			progress.step(`Pushing ${branch} to GitHub`);
+			await git.push('origin', branch, ['-u']);
+			await this.updateBranchStatus(git);
+			return { status: 'success', message: `Synced ${branch}` };
+		}, this.settings.showSyncSuccessNotice);
 	}
 
 	async startChange(changeTitle: string): Promise<void> {
-		await this.withGitLock(async () => {
-			try {
-				const git = this.getGit();
-				const status = await git.status();
-				await this.configureRemote(git);
-				await git.fetch('origin');
-				const currentBranch = await this.currentBranch(git);
-				const baseBranch = this.getBaseBranch();
-				const newBranch = normalizeBranchName(changeTitle, this.settings.branchPrefix);
-				const localBranches = await git.branchLocal();
-				if (localBranches.all.includes(newBranch) || await this.remoteBranchExists(git, newBranch)) {
-					throw new Error(`The branch ${newBranch} already exists. Choose another change name.`);
-				}
+		await this.withGitLock('Starting documentation change', async (progress) => {
+			progress.step('Inspecting local edits');
+			const git = this.getGit();
+			const status = await git.status();
 
-				if (!status.isClean()) {
-					if (currentBranch !== baseBranch) {
-						throw new Error(`Sync the edits on ${currentBranch} before starting another change.`);
-					}
-					if (status.conflicted.length > 0) {
-						throw new Error('Resolve the existing merge conflicts before starting a change.');
-					}
-					await git.checkoutLocalBranch(newBranch);
-					await this.commitLocalChanges(git);
-					if (await this.remoteBranchExists(git, baseBranch)) {
-						try {
-							await git.rebase([`origin/${baseBranch}`]);
-						} catch (error) {
-							await this.updateBranchStatus(git);
-							await this.showConflicts(git, error);
-							return;
-						}
-					}
-				} else {
-					await this.requireSynchronizedBranch(git, currentBranch);
-					await git.checkout(baseBranch);
-					if (await this.remoteBranchExists(git, baseBranch)) {
-						await git.pull('origin', baseBranch, { '--ff-only': null });
-					}
-					await git.checkoutLocalBranch(newBranch);
-				}
-				await git.push('origin', newBranch, ['-u']);
-				await this.updateBranchStatus(git);
-				this.showNotice(`Started change: ${newBranch}`, 'INFO', 8000);
-			} catch (error) {
-				this.showNotice(error, 'ERROR', 10000);
+			progress.step('Fetching branches from GitHub');
+			await this.configureRemote(git);
+			await git.fetch('origin');
+			const currentBranch = await this.currentBranch(git);
+			const baseBranch = this.getBaseBranch();
+			const newBranch = normalizeBranchName(changeTitle, this.settings.branchPrefix);
+			const localBranches = await git.branchLocal();
+			if (localBranches.all.includes(newBranch) || await this.remoteBranchExists(git, newBranch)) {
+				throw new Error(`The branch ${newBranch} already exists. Choose another change name.`);
 			}
-		});
-	}
 
-	async returnToBaseBranch(): Promise<void> {
-		await this.withGitLock(async () => {
-			try {
-				const git = this.getGit();
-				if (!(await git.status()).isClean()) {
-					throw new Error('Sync or commit your current changes before returning to the base branch.');
+			if (!status.isClean()) {
+				if (currentBranch !== baseBranch) {
+					throw new Error(`Sync the edits on ${currentBranch} before starting another change.`);
 				}
-				await this.configureRemote(git);
-				await git.fetch('origin');
-				const currentBranch = await this.currentBranch(git);
+				if (status.conflicted.length > 0) {
+					throw new Error('Resolve the existing merge conflicts before starting a change.');
+				}
+				progress.step(`Creating ${newBranch}`);
+				await git.checkoutLocalBranch(newBranch);
+				progress.step('Moving current edits onto the new branch');
+				await this.commitLocalChanges(git);
+				if (await this.remoteBranchExists(git, baseBranch)) {
+					progress.step(`Replaying edits on the latest ${baseBranch}`);
+					try {
+						await git.rebase([`origin/${baseBranch}`]);
+					} catch (error) {
+						await this.updateBranchStatus(git);
+						throw await this.conflictError(git, error);
+					}
+				}
+			} else {
+				progress.step(`Checking ${currentBranch} is synchronized`);
 				await this.requireSynchronizedBranch(git, currentBranch);
-				const baseBranch = this.getBaseBranch();
+				progress.step(`Updating ${baseBranch}`);
 				await git.checkout(baseBranch);
 				if (await this.remoteBranchExists(git, baseBranch)) {
 					await git.pull('origin', baseBranch, { '--ff-only': null });
 				}
-				await this.updateBranchStatus(git);
-				this.showNotice(`Returned to ${baseBranch}`, 'INFO');
-			} catch (error) {
-				this.showNotice(error, 'ERROR', 10000);
+				progress.step(`Creating ${newBranch}`);
+				await git.checkoutLocalBranch(newBranch);
 			}
+
+			progress.step(`Publishing ${newBranch} to GitHub`);
+			await git.push('origin', newBranch, ['-u']);
+			await this.updateBranchStatus(git);
+			return { status: 'success', message: `Started change: ${newBranch}` };
+		});
+	}
+
+	async returnToBaseBranch(): Promise<void> {
+		await this.withGitLock('Returning to the accepted branch', async (progress) => {
+			progress.step('Checking for unsaved Git changes');
+			const git = this.getGit();
+			if (!(await git.status()).isClean()) {
+				throw new Error('Sync or commit your current changes before returning to the base branch.');
+			}
+
+			progress.step('Fetching branches from GitHub');
+			await this.configureRemote(git);
+			await git.fetch('origin');
+			const currentBranch = await this.currentBranch(git);
+			progress.step(`Checking ${currentBranch} is synchronized`);
+			await this.requireSynchronizedBranch(git, currentBranch);
+			const baseBranch = this.getBaseBranch();
+			progress.step(`Switching to ${baseBranch}`);
+			await git.checkout(baseBranch);
+			if (await this.remoteBranchExists(git, baseBranch)) {
+				progress.step(`Updating ${baseBranch}`);
+				await git.pull('origin', baseBranch, { '--ff-only': null });
+			}
+			await this.updateBranchStatus(git);
+			return { status: 'success', message: `Returned to ${baseBranch}` };
 		});
 	}
 
 	async switchBranch(targetBranch: string): Promise<void> {
-		await this.withGitLock(async () => {
-			try {
-				if (!isSafeBranchRef(targetBranch)) throw new Error('The selected branch name is invalid.');
-				const git = this.getGit();
-				if (!(await git.status()).isClean()) {
-					throw new Error('Sync or discard your current edits before switching branches.');
-				}
-				await this.configureRemote(git);
-				await git.fetch('origin');
-				const currentBranch = await this.currentBranch(git);
-				if (currentBranch === targetBranch) {
-					this.showNotice(`Already on ${targetBranch}`, 'INFO');
-					return;
-				}
-				await this.requireSynchronizedBranch(git, currentBranch);
-				const localBranches = await git.branchLocal();
-				if (localBranches.all.includes(targetBranch)) {
-					await git.checkout(targetBranch);
-				} else if (await this.remoteBranchExists(git, targetBranch)) {
-					await git.checkout(['-b', targetBranch, `origin/${targetBranch}`]);
-				} else {
-					throw new Error(`The branch ${targetBranch} no longer exists.`);
-				}
-				if (await this.remoteBranchExists(git, targetBranch)) {
-					await git.pull('origin', targetBranch, { '--ff-only': null });
-				}
-				await this.updateBranchStatus(git);
-				this.showNotice(`Switched to ${targetBranch}`, 'INFO');
-			} catch (error) {
-				this.showNotice(error, 'ERROR', 10000);
+		await this.withGitLock('Switching documentation branch', async (progress) => {
+			progress.step('Validating the selected branch');
+			if (!isSafeBranchRef(targetBranch)) throw new Error('The selected branch name is invalid.');
+			const git = this.getGit();
+			if (!(await git.status()).isClean()) {
+				throw new Error('Sync or discard your current edits before switching branches.');
 			}
+
+			progress.step('Fetching branches from GitHub');
+			await this.configureRemote(git);
+			await git.fetch('origin');
+			const currentBranch = await this.currentBranch(git);
+			if (currentBranch === targetBranch) {
+				return { status: 'success', message: `Already on ${targetBranch}` };
+			}
+
+			progress.step(`Checking ${currentBranch} is synchronized`);
+			await this.requireSynchronizedBranch(git, currentBranch);
+			progress.step(`Switching to ${targetBranch}`);
+			const localBranches = await git.branchLocal();
+			if (localBranches.all.includes(targetBranch)) {
+				await git.checkout(targetBranch);
+			} else if (await this.remoteBranchExists(git, targetBranch)) {
+				await git.checkout(['-b', targetBranch, `origin/${targetBranch}`]);
+			} else {
+				throw new Error(`The branch ${targetBranch} no longer exists.`);
+			}
+			if (await this.remoteBranchExists(git, targetBranch)) {
+				progress.step(`Updating ${targetBranch}`);
+				await git.pull('origin', targetBranch, { '--ff-only': null });
+			}
+			await this.updateBranchStatus(git);
+			return { status: 'success', message: `Switched to ${targetBranch}` };
 		});
 	}
 
@@ -370,11 +519,18 @@ export default class GHSyncPlugin extends Plugin {
 		await this.loadSettings();
 		this.branchStatusEl = this.addStatusBarItem();
 		this.branchStatusEl.addClass('gh-sync-status');
-		this.registerDomEvent(this.branchStatusEl, 'click', () => this.openBranchManager());
+		this.branchStatusEl.setAttr('aria-live', 'polite');
+		this.registerDomEvent(this.branchStatusEl, 'click', () => {
+			if (!this.syncInProgress) this.openBranchManager();
+		});
 
 		const ribbonIconEl = this.addRibbonIcon('github', 'Sync current branch', () => void this.syncNotes());
 		ribbonIconEl.addClass('gh-sync-ribbon');
-		this.addRibbonIcon('git-branch', 'Open branch manager', () => this.openBranchManager());
+		const branchRibbonEl = this.addRibbonIcon('git-branch', 'Open branch manager', () => {
+			if (!this.syncInProgress) this.openBranchManager();
+		});
+		branchRibbonEl.addClass('gh-sync-branch-ribbon');
+		this.gitControlEls.push(ribbonIconEl, branchRibbonEl);
 
 		this.addCommand({ id: 'github-sync-command', name: 'Sync current branch', callback: () => void this.syncNotes() });
 		this.addCommand({ id: 'github-sync-branch-manager', name: 'Open branch manager', callback: () => this.openBranchManager() });
