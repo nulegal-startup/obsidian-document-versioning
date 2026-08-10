@@ -25,8 +25,8 @@ This fork adds a non-technical, branch-based documentation workflow to Kevin Chi
 - Keep a workspace-wide Conflict Center with document and section counts.
 - Offer review-only Codex, Ollama, or LM Studio suggestions for one conflict at a time.
 - Create or reuse a draft GitHub pull request when a change branch is published.
-- Attach selected-text comments to that review without changing the Markdown document.
-- Support collaborator mentions, replies, resolve/reopen, and a workspace Review Center.
+- Show a visible **Comment** control beside selected text and attach the discussion without changing the Markdown document.
+- Autocomplete repository collaborators as the author types `@`, plus replies, resolve/reopen, and a workspace Review Center.
 - Prevent overlapping manual, startup, and scheduled Git operations.
 - Reject credential-bearing remote URLs and redact common GitHub tokens from errors.
 

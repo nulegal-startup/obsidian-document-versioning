@@ -17,6 +17,8 @@ import { conflictEditorExtension } from './conflict-editor';
 import { ConflictHunk, parseConflictDocument } from './conflict-engine';
 import { createTextAnchor, reanchorText, TextAnchor } from './review-anchor';
 import { GitHubRepository, GitHubReviewClient, GitHubReviewComment, PullRequestInfo, parseGitHubRepository } from './github-review';
+import { reviewEditorExtension } from './review-editor';
+import { applyMention, matchingMentions, mentionQueryAt, MentionQuery } from './review-mention';
 
 type NoticeLevelSetting = 'ALL' | 'WARNING' | 'ERROR';
 type LegacyNoticeLevelSetting = NoticeLevelSetting | 'WARNINGS';
@@ -966,6 +968,9 @@ export default class GHSyncPlugin extends Plugin {
 			requestAISuggestion: (filePath, hunk, before, after) => this.requestAISuggestion({ filePath, hunk, before, after }),
 			aiProviderLabel: () => this.aiProviderLabel(),
 		}));
+		this.registerEditorExtension(reviewEditorExtension({
+			commentOnSelection: () => void this.commentOnSelection(),
+		}));
 		this.branchStatusEl = this.addStatusBarItem();
 		this.branchStatusEl.addClass('gh-sync-status');
 		this.branchStatusEl.setAttr('aria-live', 'polite');
@@ -1225,22 +1230,92 @@ class ReviewCommentModal extends Modal {
 		this.contentEl.createEl('h2', { text: 'Comment on selected text' });
 		this.contentEl.createDiv({ cls: 'gh-sync-review-modal__location', text: `${this.anchor.path} · lines ${this.anchor.startLine}–${this.anchor.endLine}` });
 		this.contentEl.createEl('blockquote', { text: this.anchor.selectedText.slice(0, 1000) });
-		const textarea = this.contentEl.createEl('textarea', {
+		const composer = this.contentEl.createDiv({ cls: 'gh-sync-review-modal__composer' });
+		const textarea = composer.createEl('textarea', {
 			cls: 'gh-sync-review-modal__input',
-			attr: { placeholder: 'Add context or a decision. Type @ to notify a collaborator.', rows: '6', maxlength: '20000' },
+			attr: {
+				placeholder: 'Add context or a decision. Type @ to notify a collaborator.',
+				rows: '6',
+				maxlength: '20000',
+				role: 'combobox',
+				'aria-autocomplete': 'list',
+				'aria-controls': 'gh-sync-mention-suggestions',
+				'aria-expanded': 'false',
+			},
 		});
-		textarea.addEventListener('input', () => this.body = textarea.value);
-		const people = this.contentEl.createDiv({ cls: 'gh-sync-review-modal__people' });
-		people.createSpan({ text: 'Mention: ' });
-		for (const collaborator of this.collaborators.slice(0, 12)) {
-			const button = people.createEl('button', { text: `@${collaborator}`, attr: { type: 'button' } });
-			button.addEventListener('click', () => {
-				const mention = `@${collaborator} `;
-				textarea.setRangeText(mention, textarea.selectionStart, textarea.selectionEnd, 'end');
-				this.body = textarea.value;
-				textarea.focus();
-			});
-		}
+		const suggestions = composer.createDiv({
+			cls: 'gh-sync-review-modal__suggestions',
+			attr: { id: 'gh-sync-mention-suggestions', role: 'listbox', 'aria-label': 'GitHub collaborators' },
+		});
+		const mentionHint = this.contentEl.createDiv({
+			cls: 'gh-sync-review-modal__mention-hint',
+			text: this.collaborators.length > 0
+				? 'Type @ to search and notify a GitHub collaborator.'
+				: 'No repository collaborators were returned by GitHub.',
+		});
+		let activeMention: MentionQuery | undefined;
+		let matches: string[] = [];
+		let selectedIndex = 0;
+		const chooseMention = (user: string): void => {
+			if (!activeMention) return;
+			const applied = applyMention(textarea.value, activeMention, user);
+			textarea.value = applied.text;
+			textarea.setSelectionRange(applied.cursor, applied.cursor);
+			this.body = textarea.value;
+			suggestions.empty();
+			suggestions.removeClass('is-visible');
+			textarea.setAttr('aria-expanded', 'false');
+			textarea.focus();
+		};
+		const renderSuggestions = (): void => {
+			activeMention = mentionQueryAt(textarea.value, textarea.selectionStart);
+			matches = activeMention ? matchingMentions(this.collaborators, activeMention.query) : [];
+			selectedIndex = Math.min(selectedIndex, Math.max(0, matches.length - 1));
+			suggestions.empty();
+			if (!activeMention || this.collaborators.length === 0) {
+				suggestions.removeClass('is-visible');
+				textarea.setAttr('aria-expanded', 'false');
+				return;
+			}
+			if (matches.length === 0) {
+				suggestions.createDiv({ cls: 'gh-sync-review-modal__suggestion-empty', text: `No users match “${activeMention.query}”` });
+			} else {
+				matches.forEach((user, index) => {
+					const option = suggestions.createEl('button', {
+						cls: `gh-sync-review-modal__suggestion${index === selectedIndex ? ' is-selected' : ''}`,
+						attr: { type: 'button', role: 'option', 'aria-selected': String(index === selectedIndex) },
+					});
+					const avatar = option.createSpan({ cls: 'gh-sync-review-modal__suggestion-avatar', text: user.slice(0, 1).toUpperCase() });
+					avatar.setAttr('aria-hidden', 'true');
+					option.createSpan({ text: `@${user}` });
+					option.addEventListener('mousedown', (event) => event.preventDefault());
+					option.addEventListener('click', () => chooseMention(user));
+				});
+			}
+			suggestions.addClass('is-visible');
+			textarea.setAttr('aria-expanded', 'true');
+		};
+		textarea.addEventListener('input', () => {
+			this.body = textarea.value;
+			selectedIndex = 0;
+			renderSuggestions();
+		});
+		textarea.addEventListener('click', renderSuggestions);
+		textarea.addEventListener('keydown', (event) => {
+			if (!suggestions.hasClass('is-visible') || matches.length === 0) return;
+			if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+				event.preventDefault();
+				selectedIndex = (selectedIndex + (event.key === 'ArrowDown' ? 1 : -1) + matches.length) % matches.length;
+				renderSuggestions();
+			} else if (event.key === 'Enter' || event.key === 'Tab') {
+				event.preventDefault();
+				chooseMention(matches[selectedIndex]);
+			} else if (event.key === 'Escape') {
+				event.preventDefault();
+				suggestions.removeClass('is-visible');
+				textarea.setAttr('aria-expanded', 'false');
+			}
+		});
 		const status = this.contentEl.createDiv({ cls: 'gh-sync-review-modal__status', attr: { 'aria-live': 'polite' } });
 		const actions = this.contentEl.createDiv({ cls: 'gh-sync-review-modal__actions' });
 		const cancel = actions.createEl('button', { text: 'Cancel', attr: { type: 'button' } });

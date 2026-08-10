@@ -1068,6 +1068,48 @@
 .gh-sync-review-modal { width: min(620px, calc(100vw - 32px)); }
 .gh-sync-review-modal__location { color: var(--text-muted); font-size: var(--font-ui-small); }
 
+.markdown-source-view .cm-editor { position: relative; }
+
+.gh-sync-selection-comment {
+  align-items: center;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  box-shadow: 0 2px 5px rgba(0, 0, 0, .12), 0 8px 24px rgba(0, 0, 0, .10);
+  color: var(--text-normal);
+  display: inline-flex;
+  font-size: var(--font-ui-small);
+  font-weight: var(--font-medium);
+  gap: 6px;
+  min-height: 34px;
+  opacity: 0;
+  padding: 5px 9px;
+  pointer-events: none;
+  position: absolute;
+  transform: translateY(-3px) scale(.98);
+  transition-property: opacity, transform, background-color, border-color;
+  transition-duration: 120ms;
+  transition-timing-function: ease-out;
+  z-index: var(--layer-popover);
+}
+
+.gh-sync-selection-comment.is-visible {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0) scale(1);
+}
+
+.gh-sync-selection-comment:hover { background: var(--background-modifier-hover); }
+.gh-sync-selection-comment:active { transform: scale(.96); }
+
+.gh-sync-selection-comment__icon,
+.gh-sync-selection-comment__icon svg {
+  height: 16px;
+  width: 16px;
+}
+
+.gh-sync-review-modal__composer { position: relative; }
+
 .gh-sync-review-modal__input {
   background: var(--background-primary);
   border: 1px solid var(--background-modifier-border);
@@ -1080,6 +1122,72 @@
 }
 
 .gh-sync-review-modal__input:focus { border-color: var(--interactive-accent); box-shadow: 0 0 0 2px var(--background-modifier-border-focus); }
+
+.gh-sync-review-modal__suggestions {
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  box-shadow: 0 3px 8px rgba(0, 0, 0, .12), 0 12px 32px rgba(0, 0, 0, .14);
+  display: none;
+  left: 8px;
+  max-height: 248px;
+  overflow-y: auto;
+  padding: 5px;
+  position: absolute;
+  right: 8px;
+  top: calc(100% - 4px);
+  z-index: var(--layer-popover);
+}
+
+.gh-sync-review-modal__suggestions.is-visible { display: block; }
+
+.gh-sync-review-modal__suggestion {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: calc(var(--radius-m) - 5px);
+  box-shadow: none;
+  color: var(--text-normal);
+  display: flex;
+  font-size: var(--font-ui-small);
+  gap: 9px;
+  justify-content: flex-start;
+  min-height: 40px;
+  padding: 6px 8px;
+  text-align: left;
+  width: 100%;
+}
+
+.gh-sync-review-modal__suggestion:hover,
+.gh-sync-review-modal__suggestion.is-selected { background: var(--background-modifier-hover); }
+
+.gh-sync-review-modal__suggestion-avatar {
+  align-items: center;
+  background: var(--interactive-accent);
+  border-radius: 50%;
+  color: var(--text-on-accent);
+  display: inline-flex;
+  flex: 0 0 26px;
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--font-semibold);
+  height: 26px;
+  justify-content: center;
+  text-transform: uppercase;
+}
+
+.gh-sync-review-modal__suggestion-empty {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  padding: 10px;
+  text-wrap: pretty;
+}
+
+.gh-sync-review-modal__mention-hint {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  margin-top: 6px;
+  text-wrap: pretty;
+}
 
 .gh-sync-review-modal__people {
   align-items: center;
@@ -1147,6 +1255,10 @@
   .gh-sync-review-ribbon:active,
   .gh-sync-header-branch:active {
     transform: none;
+  }
+
+  .gh-sync-selection-comment {
+    transition-duration: 0ms;
   }
 }
 
