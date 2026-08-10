@@ -69,6 +69,7 @@ The plugin automatically merges non-overlapping changes. If Git reports a confli
 
 - does not push;
 - opens each conflicting document in a guided resolver;
+- restores the resolver automatically when Obsidian starts with an unfinished conflict;
 - shows the complete current-branch and GitHub versions without raw Git markers;
 - lets the user explicitly keep either complete version, or open the note for manual editing; and
 - stages the selected resolution, then waits for **Continue sync** before committing or pushing.

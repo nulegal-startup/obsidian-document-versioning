@@ -167,6 +167,7 @@ export default class GHSyncPlugin extends Plugin {
 	private displayedBranch?: string;
 	private displayedSync?: BranchSyncSummary;
 	private displayedDirty = false;
+	private conflictResolverOpen = false;
 	private dirtyRefreshTimer?: number;
 	private readonly gitControlEls: HTMLElement[] = [];
 
@@ -435,13 +436,21 @@ export default class GHSyncPlugin extends Plugin {
 		this.app.workspace.openLinkText(this.safeConflictPath(file), '', true);
 	}
 
+	private openConflictResolver(files: string[]): void {
+		if (this.conflictResolverOpen || files.length === 0) return;
+		this.conflictResolverOpen = true;
+		new ConflictResolutionModal(this.app, this, files, () => {
+			this.conflictResolverOpen = false;
+		}).open();
+	}
+
 	private async handleConflicts(git: SimpleGit, pullError: unknown): Promise<string> {
 		const status = await git.status();
 		const conflicts = status.conflicted;
 		if (conflicts.length === 0) {
 			throw new Error(`Git could not merge the remote changes. No files were pushed.\n${redactSensitiveText(pullError)}`);
 		}
-		new ConflictResolutionModal(this.app, this, conflicts).open();
+		this.openConflictResolver(conflicts);
 		return `Sync paused for ${conflicts.length} conflicted document${conflicts.length === 1 ? '' : 's'}. The conflict resolver is open.`;
 	}
 
@@ -455,7 +464,7 @@ export default class GHSyncPlugin extends Plugin {
 			const status = await git.status();
 			const branch = await this.currentBranch(git);
 			if (status.conflicted.length > 0) {
-				new ConflictResolutionModal(this.app, this, status.conflicted).open();
+				this.openConflictResolver(status.conflicted);
 				return {
 					status: 'warning',
 					message: `Sync paused for ${status.conflicted.length} conflicted document${status.conflicted.length === 1 ? '' : 's'}. The conflict resolver is open.`,
@@ -643,10 +652,15 @@ export default class GHSyncPlugin extends Plugin {
 		if (this.syncInProgress) return;
 		try {
 			const git = this.getGit();
+			const status = await git.status();
+			if (status.conflicted.length > 0) {
+				await this.updateBranchStatus(git);
+				this.openConflictResolver(status.conflicted);
+				return;
+			}
 			await this.configureRemote(git);
 			await git.fetch('origin');
 			const branch = await this.currentBranch(git);
-			const status = await git.status();
 			const published = await this.remoteBranchExists(git, branch);
 			if (!published) {
 				await this.updateBranchStatus(git, describeBranchSync(0, 0, false));
@@ -747,6 +761,7 @@ class ConflictResolutionModal extends Modal {
 		app: App,
 		private readonly plugin: GHSyncPlugin,
 		private readonly files: string[],
+		private readonly onDismiss: () => void,
 	) {
 		super(app);
 	}
@@ -863,6 +878,7 @@ class ConflictResolutionModal extends Modal {
 	}
 
 	onClose(): void {
+		this.onDismiss();
 		this.contentEl.empty();
 	}
 }
