@@ -81,4 +81,4 @@ See [SECURITY_REVIEW.md](SECURITY_REVIEW.md) for the focused review performed fo
 
 ## Attribution
 
-Original plugin by [Kevin Chin](https://github.com/kevinmkchin). This fork remains under the repository's MIT license.
+Maintained by [NuLegal](https://github.com/nulegal-startup). Originally created by [Kevin Chin](https://github.com/kevinmkchin); this fork remains under the repository's MIT license.

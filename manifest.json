@@ -1,10 +1,10 @@
 {
 	"id": "github-sync",
 	"name": "GitHub Sync",
-	"version": "1.1.0",
+	"version": "1.1.1",
 	"minAppVersion": "0.15.0",
 	"description": "Sync an Obsidian vault through safe, branch-based documentation changes.",
-	"author": "Kevin Chin",
-	"authorUrl": "https://kevin.gd/",
+	"author": "NuLegal",
+	"authorUrl": "https://github.com/nulegal-startup/Obsidian-GitHub-Sync",
 	"isDesktopOnly": true
 }
