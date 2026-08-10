@@ -1068,8 +1068,6 @@
 .gh-sync-review-modal { width: min(620px, calc(100vw - 32px)); }
 .gh-sync-review-modal__location { color: var(--text-muted); font-size: var(--font-ui-small); }
 
-.markdown-source-view .cm-editor { position: relative; }
-
 .gh-sync-selection-comment {
   align-items: center;
   background: var(--background-primary);
@@ -1085,7 +1083,7 @@
   opacity: 0;
   padding: 5px 9px;
   pointer-events: none;
-  position: absolute;
+  position: fixed;
   transform: translateY(-3px) scale(.98);
   transition-property: opacity, transform, background-color, border-color;
   transition-duration: 120ms;

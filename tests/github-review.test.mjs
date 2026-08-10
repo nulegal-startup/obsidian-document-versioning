@@ -55,9 +55,9 @@ test('passes comment text as one argument without a shell', async () => {
 
 test('slurps paginated review comments into one JSON array', async () => {
 	const calls = [];
-	const client = new github.GitHubReviewClient('gh', async (args) => { calls.push(args); return '[]'; });
+	const client = new github.GitHubReviewClient('gh', async (args) => { calls.push(args); return '[[],[]]'; });
 	assert.deepEqual(await client.listComments({ owner: 'acme', repo: 'docs' }, 4), []);
 	assert.equal(calls[0].includes('--paginate'), true);
 	assert.equal(calls[0].includes('--slurp'), true);
-	assert.equal(calls[0].includes('add'), true);
+	assert.equal(calls[0].includes('--jq'), false);
 });

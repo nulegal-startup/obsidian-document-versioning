@@ -25,7 +25,7 @@ class SelectionCommentControl {
 			event.stopPropagation();
 			this.callbacks.commentOnSelection();
 		});
-		this.view.dom.appendChild(this.button);
+		document.body.appendChild(this.button);
 		this.scheduleRender();
 	}
 
@@ -57,11 +57,10 @@ class SelectionCommentControl {
 			this.button.removeClass('is-visible');
 			return;
 		}
-		const editorRect = this.view.dom.getBoundingClientRect();
 		const buttonWidth = 104;
-		const left = Math.max(8, Math.min(coords.left - editorRect.left, editorRect.width - buttonWidth - 8));
-		const below = coords.bottom - editorRect.top + 7;
-		const top = below + 42 < editorRect.height ? below : coords.top - editorRect.top - 39;
+		const left = Math.max(8, Math.min(coords.left, window.innerWidth - buttonWidth - 8));
+		const below = coords.bottom + 7;
+		const top = below + 42 < window.innerHeight ? below : coords.top - 39;
 		this.button.style.left = `${Math.round(left)}px`;
 		this.button.style.top = `${Math.round(Math.max(8, top))}px`;
 		this.button.addClass('is-visible');

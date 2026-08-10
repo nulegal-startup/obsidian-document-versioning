@@ -78,9 +78,10 @@ export class GitHubReviewClient {
 	async listComments(repository: GitHubRepository, pullNumber: number): Promise<GitHubReviewComment[]> {
 		const raw = await this.run([
 			'api', `repos/${repository.owner}/${repository.repo}/issues/${pullNumber}/comments?per_page=100`,
-			'--paginate', '--slurp', '--jq', 'add',
+			'--paginate', '--slurp',
 		]);
-		const comments = JSON.parse(raw) as Array<{ id: number; html_url: string; user?: { login?: string }; created_at: string; body: string }>;
+		const pages = JSON.parse(raw) as Array<Array<{ id: number; html_url: string; user?: { login?: string }; created_at: string; body: string }>>;
+		const comments = pages.reduce((all, page) => all.concat(page), []);
 		return comments.flatMap((comment) => {
 			const metadata = decodeReviewMetadata(comment.body || '');
 			return metadata ? [{
