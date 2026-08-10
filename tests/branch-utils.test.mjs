@@ -56,3 +56,54 @@ test('describes every deterministic branch synchronization state', () => {
 		state: 'unpublished', label: 'Not published', compact: 'Local only',
 	});
 });
+
+test('builds complete current and incoming documents from Git conflict markers', () => {
+	const conflict = [
+		'# Shared title',
+		'<<<<<<< HEAD',
+		'Current paragraph',
+		'=======',
+		'Incoming paragraph',
+		'>>>>>>> origin/changes/example',
+		'',
+		'Common ending',
+		'<<<<<<< HEAD',
+		'Current final line',
+		'=======',
+		'Incoming final line',
+		'>>>>>>> origin/changes/example',
+		'',
+	].join('\n');
+
+	assert.deepEqual(helpers.parseGitConflict(conflict), {
+		current: '# Shared title\nCurrent paragraph\n\nCommon ending\nCurrent final line\n',
+		incoming: '# Shared title\nIncoming paragraph\n\nCommon ending\nIncoming final line\n',
+		conflictCount: 2,
+	});
+});
+
+test('rejects malformed or marker-free conflict text', () => {
+	assert.throws(() => helpers.parseGitConflict('# No conflict here\n'));
+	assert.throws(() => helpers.parseGitConflict('<<<<<<< HEAD\nIncomplete\n'));
+});
+
+test('preserves CRLF line endings and ignores the base section in diff3 conflicts', () => {
+	const conflict = [
+		'Before',
+		'<<<<<<< HEAD',
+		'Current',
+		'||||||| base',
+		'Original',
+		'=======',
+		'Incoming',
+		'>>>>>>> origin/changes/example',
+		'After',
+		'',
+	].join('\r\n');
+
+	assert.deepEqual(helpers.parseGitConflict(conflict), {
+		current: 'Before\r\nCurrent\r\nAfter\r\n',
+		incoming: 'Before\r\nIncoming\r\nAfter\r\n',
+		conflictCount: 1,
+	});
+});

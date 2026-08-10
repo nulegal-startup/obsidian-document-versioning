@@ -21,7 +21,7 @@ This fork adds a non-technical, branch-based documentation workflow to Kevin Chi
 - Fast-forward clean remote-only updates through an explicit **Update branch** action.
 - Require **Sync current** when local edits or commits must be saved, merged, or pushed.
 - Refuse to switch branches when local or remote work is not synchronized.
-- Stop on merge conflicts and open each conflicting note for resolution.
+- Pause on merge conflicts and open a guided, side-by-side document resolver.
 - Prevent overlapping manual, startup, and scheduled Git operations.
 - Reject credential-bearing remote URLs and redact common GitHub tokens from errors.
 
@@ -68,9 +68,10 @@ Do not embed a GitHub token in the remote URL. Use SSH or Git Credential Manager
 The plugin automatically merges non-overlapping changes. If Git reports a conflict, the plugin:
 
 - does not push;
-- lists the conflicting files;
-- opens those notes in Obsidian; and
-- requires the conflict to be resolved before synchronization can continue.
+- opens each conflicting document in a guided resolver;
+- shows the complete current-branch and GitHub versions without raw Git markers;
+- lets the user explicitly keep either complete version, or open the note for manual editing; and
+- stages the selected resolution, then waits for **Continue sync** before committing or pushing.
 
 It never silently selects one version of a conflicted note.
 

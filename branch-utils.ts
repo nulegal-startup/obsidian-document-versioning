@@ -92,3 +92,61 @@ export function describeBranchSync(ahead: number, behind: number, published: boo
 	if (ahead > 0) return { state: 'ahead', label: `${ahead} ahead`, compact: `↑${ahead}` };
 	return { state: 'up-to-date', label: 'Up to date', compact: '✓' };
 }
+
+export interface GitConflictVersions {
+	current: string;
+	incoming: string;
+	conflictCount: number;
+}
+
+export function parseGitConflict(text: string): GitConflictVersions {
+	type ParseState = 'shared' | 'current' | 'base' | 'incoming';
+	const newline = text.includes('\r\n') ? '\r\n' : '\n';
+	const normalized = text.replace(/\r\n?/g, '\n');
+	const hasFinalNewline = normalized.endsWith('\n');
+	const lines = normalized.split('\n');
+	if (hasFinalNewline) lines.pop();
+
+	const current: string[] = [];
+	const incoming: string[] = [];
+	let state: ParseState = 'shared';
+	let conflictCount = 0;
+
+	for (const line of lines) {
+		if (state === 'shared' && /^<<<<<<<(?: |$)/.test(line)) {
+			state = 'current';
+			continue;
+		}
+		if (state === 'current' && /^\|\|\|\|\|\|\|(?: |$)/.test(line)) {
+			state = 'base';
+			continue;
+		}
+		if ((state === 'current' || state === 'base') && /^=======$/.test(line)) {
+			state = 'incoming';
+			continue;
+		}
+		if (state === 'incoming' && /^>>>>>>>(?: |$)/.test(line)) {
+			state = 'shared';
+			conflictCount += 1;
+			continue;
+		}
+		if (/^(?:<<<<<<<|\|\|\|\|\|\|\||=======|>>>>>>>)(?: |$)/.test(line)) {
+			throw new Error('The conflict markers are malformed. Open the note for manual resolution.');
+		}
+
+		if (state === 'shared') {
+			current.push(line);
+			incoming.push(line);
+		} else if (state === 'current') {
+			current.push(line);
+		} else if (state === 'incoming') {
+			incoming.push(line);
+		}
+	}
+
+	if (state !== 'shared' || conflictCount === 0) {
+		throw new Error('No complete Git conflict was found. Open the note for manual resolution.');
+	}
+	const suffix = hasFinalNewline ? newline : '';
+	return { current: current.join(newline) + suffix, incoming: incoming.join(newline) + suffix, conflictCount };
+}
