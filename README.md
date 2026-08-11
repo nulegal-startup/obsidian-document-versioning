@@ -70,7 +70,17 @@ Document history is read-only and uses only the vault's local Git data. Opening 
 
 ## Setup
 
-For the managed NuLegal vault, use the repository's double-click installer. It installs Obsidian and the required helpers, clones the private vault, installs this plugin, and opens GitHub's browser/device approval. Users do not need to create SSH keys, paste tokens, or type Git commands.
+For the managed NuLegal vault, follow the private [`nulegal-startup/docs` setup guide](https://github.com/nulegal-startup/docs#fast-setup-with-any-local-ai-agent). A local AI agent runs the reviewed Homebrew and Make commands to install Obsidian, Git, GitHub CLI, and `jq`; connect GitHub through the browser; clone both private repositories; install the latest private release; and open the vault. Users do not create SSH keys or paste tokens.
+
+After the docs repository is cloned, the complete interface is:
+
+```bash
+make setup   # Complete or repair setup.
+make update  # Fetch both private repos and install the latest plugin release.
+make doctor  # Run read-only diagnostics.
+```
+
+Obsidian's public Community Plugins updater does not cover this private unlisted extension. The private docs repository's `make update` target downloads the latest authenticated GitHub release, validates its manifest and checksums, preserves plugin settings, and reloads it on the next Obsidian start.
 
 On first launch, the plugin opens **Connect documentation to GitHub**. It checks Git, the vault remote, the active account, and repository access. Choose **Connect GitHub** to approve in the browser. If GitHub requests a one-time code, paste it—the helper already copied it. GitHub CLI manages the saved credential and normally uses the operating system credential store; the UI warns when the CLI reports plaintext fallback. The connection is reused across browser, Obsidian, and computer restarts. The plugin never starts login solely because the network is temporarily unavailable.
 
@@ -80,7 +90,7 @@ For a manually prepared vault, configure these plugin settings:
 - **Base branch:** normally `main`.
 - **Protect base branch:** keep enabled to prevent direct commits to `main`.
 - **Change branch prefix:** normally `changes`.
-- **Git binary location:** an advanced repair option; the managed installer configures Git automatically.
+- **Git binary location:** an advanced repair option; `make setup` configures Homebrew Git automatically.
 - **Create draft review automatically:** keep enabled to connect each published change branch to one draft pull request.
 - **GitHub CLI executable:** an advanced repair option; use the in-plugin GitHub connection screen for browser login.
 - **AI provider:** optional; disabled by default. Codex uses the local Codex CLI login, while Ollama and LM Studio use a local model server through the Codex CLI.
