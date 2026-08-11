@@ -78,6 +78,8 @@ Both views use only the vault's local Git data. Opening or refreshing them never
 
 For the managed NuLegal vault, follow the private [`nulegal-startup/docs` setup guide](https://github.com/nulegal-startup/docs#install-on-macos). It installs Obsidian, Git, GitHub CLI, the private extension, and the documentation vault. Users log in through the browser without creating SSH keys or pasting tokens.
 
+The private repository, `main` base branch, `changes/*` workflow, and base-branch protection are built in on first run. Users never enter a repository URL.
+
 After the docs repository is cloned, the complete interface is:
 
 ```bash

@@ -47,6 +47,7 @@ import {
 	LocalChangesService,
 	LocalChangesSnapshot,
 } from './local-changes';
+import { NULEGAL_WORKFLOW_DEFAULTS, withNuLegalRepositoryDefault } from './workflow-defaults';
 
 type NoticeLevelSetting = 'ALL' | 'WARNING' | 'ERROR';
 type LegacyNoticeLevelSetting = NoticeLevelSetting | 'WARNINGS';
@@ -73,11 +74,11 @@ interface GHSyncSettings {
 }
 
 const DEFAULT_SETTINGS: GHSyncSettings = {
-	remoteURL: '',
+	remoteURL: NULEGAL_WORKFLOW_DEFAULTS.remoteURL,
 	gitLocation: '',
-	baseBranch: 'main',
-	branchPrefix: 'changes',
-	protectBaseBranch: true,
+	baseBranch: NULEGAL_WORKFLOW_DEFAULTS.baseBranch,
+	branchPrefix: NULEGAL_WORKFLOW_DEFAULTS.branchPrefix,
+	protectBaseBranch: NULEGAL_WORKFLOW_DEFAULTS.protectBaseBranch,
 	syncinterval: 0,
 	isSyncOnLoad: false,
 	checkStatusOnLoad: true,
@@ -87,7 +88,7 @@ const DEFAULT_SETTINGS: GHSyncSettings = {
 	codexExecutable: '',
 	aiConsentProvider: 'disabled',
 	githubCliPath: '',
-	autoCreateDraftPR: true,
+	autoCreateDraftPR: NULEGAL_WORKFLOW_DEFAULTS.autoCreateDraftPR,
 	setupAssistantSeen: false,
 	documentRenameHints: {},
 };
@@ -1674,7 +1675,7 @@ export default class GHSyncPlugin extends Plugin {
 	}
 
 	async loadSettings(): Promise<void> {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		this.settings = withNuLegalRepositoryDefault(Object.assign({}, DEFAULT_SETTINGS, await this.loadData()));
 		if ((this.settings.noticeLevel as LegacyNoticeLevelSetting) === 'WARNINGS') this.settings.noticeLevel = 'WARNING';
 	}
 
@@ -2921,14 +2922,6 @@ class GHSyncSettingTab extends PluginSettingTab {
 		const howto = containerEl.createEl('div', { cls: 'howto' });
 		howto.createEl('div', { text: 'Branch-based documentation workflow', cls: 'howto_title' });
 		howto.createEl('small', { text: 'The base branch is not a branch selector. Use the Branch Manager to start or switch changes, then sync the explicitly displayed current branch.', cls: 'howto_text' });
-
-		new Setting(containerEl)
-			.setName('Remote URL')
-			.setDesc('The installer configures a passwordless GitHub HTTPS address. Never put a password or token here.')
-			.addText((text) => text.setValue(this.plugin.settings.remoteURL).onChange(async (value) => {
-				this.plugin.settings.remoteURL = value;
-				await this.plugin.saveSettings();
-			}));
 
 		new Setting(containerEl)
 			.setName('Base branch')
