@@ -115,9 +115,9 @@ test('applies a revert plan in a deterministic order and only touches its paths'
 	}, async (path) => { calls.push(['remove', path]); });
 
 	assert.deepEqual(calls, [
-		['git', 'reset', '--', 'docs/Old Name.md', 'docs/New Name.md'],
+		['git', '--literal-pathspecs', 'reset', '--', 'docs/Old Name.md', 'docs/New Name.md'],
 		['remove', 'docs/New Name.md'],
-		['git', 'restore', '--source=HEAD', '--worktree', '--', 'docs/Old Name.md'],
+		['git', '--literal-pathspecs', 'restore', '--source=HEAD', '--worktree', '--', 'docs/Old Name.md'],
 	]);
 });
 
