@@ -38,6 +38,7 @@ export function withoutGitHubTokenEnvironment(
 	for (const name of [
 		'GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN',
 		'GH_PROMPT_DISABLED', 'GH_DEBUG', 'GH_TRACE',
+		'GIT_PAGER', 'PAGER',
 	]) {
 		delete clean[name];
 	}
