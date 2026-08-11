@@ -90,7 +90,7 @@ class ConflictHunkWidget extends WidgetType {
 			const disabled = iconButton(actions, 'AI suggestions off', 'sparkles', () => undefined);
 			disabled.addClass('is-secondary');
 			disabled.disabled = true;
-			disabled.setAttr('title', 'Enable an AI provider in GitHub Sync settings.');
+			disabled.setAttr('title', 'Enable an AI provider in Document Versioning settings.');
 		}
 		return root;
 	}

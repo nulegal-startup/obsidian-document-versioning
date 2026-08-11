@@ -1,6 +1,6 @@
 # Security Review
 
-Review scope: branch workflow fork of Obsidian GitHub Sync, including Git and GitHub CLI command construction, vault changes, remote configuration, credentials, dependencies, selected-text reviews, conflict behavior, and optional AI conflict suggestions.
+Review scope: NuLegal Document Versioning for Obsidian, including Git and GitHub CLI command construction, vault changes, remote configuration, credentials, dependencies, selected-text reviews, conflict behavior, and optional AI conflict suggestions.
 
 ## Resolved findings
 

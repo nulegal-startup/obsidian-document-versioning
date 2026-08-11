@@ -62,7 +62,7 @@ export class GitHubReviewClient {
 		if (existing[0]) return existing[0];
 		await this.run([
 			'pr', 'create', '--repo', fullRepo, '--draft', '--base', base, '--head', head,
-			'--title', title || `Docs: ${head}`, '--body', 'Documentation review created by Obsidian GitHub Sync.',
+			'--title', title || `Docs: ${head}`, '--body', 'Documentation review created by NuLegal Document Versioning.',
 		]);
 		const created = JSON.parse(await this.run([
 			'pr', 'list', '--repo', fullRepo, '--head', head, '--base', base, '--state', 'open',

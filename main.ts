@@ -1,9 +1,10 @@
-import { App, Editor, FileSystemAdapter, ItemView, MarkdownView, Menu, Modal, Notice, Plugin, PluginSettingTab, Setting, setIcon, WorkspaceLeaf } from 'obsidian';
+import { App, Editor, FileSystemAdapter, ItemView, MarkdownView, Menu, Modal, Notice, Plugin, PluginSettingTab, Setting, setIcon, TFile, WorkspaceLeaf } from 'obsidian';
 import { simpleGit, SimpleGit, SimpleGitOptions, StatusResult } from 'simple-git';
 import { clearIntervalAsync, setIntervalAsync } from 'set-interval-async';
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
+import { execFile } from 'child_process';
 import {
 	BranchSyncSummary,
 	describeBranchSync,
@@ -31,6 +32,13 @@ import {
 } from './github-auth';
 import { createReviewReadyCommit } from './start-change';
 import { configureMatchingGitHubOrigin, hasEffectiveGitHubCredentialHelper, requireMatchingGitHubOrigin } from './github-vault';
+import {
+	DocumentHistoryService,
+	DocumentHistoryGit,
+	DocumentHistorySnapshot,
+	DocumentPatch,
+	DocumentVersion,
+} from './document-history';
 
 type NoticeLevelSetting = 'ALL' | 'WARNING' | 'ERROR';
 type LegacyNoticeLevelSetting = NoticeLevelSetting | 'WARNINGS';
@@ -53,6 +61,7 @@ interface GHSyncSettings {
 	githubCliPath: string;
 	autoCreateDraftPR: boolean;
 	setupAssistantSeen: boolean;
+	documentRenameHints: Record<string, string>;
 }
 
 const DEFAULT_SETTINGS: GHSyncSettings = {
@@ -72,10 +81,12 @@ const DEFAULT_SETTINGS: GHSyncSettings = {
 	githubCliPath: '',
 	autoCreateDraftPR: true,
 	setupAssistantSeen: false,
+	documentRenameHints: {},
 };
 
 const CONFLICT_CENTER_VIEW = 'github-sync-conflict-center';
 const REVIEW_CENTER_VIEW = 'github-sync-review-center';
+const DOCUMENT_HISTORY_VIEW = 'github-sync-document-history';
 
 interface ReviewSnapshot {
 	repository: GitHubRepository;
@@ -216,6 +227,8 @@ export default class GHSyncPlugin extends Plugin {
 	private syncTimer?: ReturnType<typeof setIntervalAsync>;
 	private branchStatusEl?: HTMLElement;
 	private headerBranchBadgeEl?: HTMLButtonElement;
+	private headerHistoryButtonEl?: HTMLButtonElement;
+	private headerDocumentPath?: string;
 	private displayedBranch?: string;
 	private displayedSync?: BranchSyncSummary;
 	private displayedDirty = false;
@@ -246,7 +259,7 @@ export default class GHSyncPlugin extends Plugin {
 	private getGit(): SimpleGit {
 		const adapter = this.app.vault.adapter;
 		if (!(adapter instanceof FileSystemAdapter)) {
-			throw new Error('GitHub Sync requires a desktop vault stored on the local file system.');
+			throw new Error('Document Versioning requires a desktop vault stored on the local file system.');
 		}
 
 		const configuredLocation = this.settings.gitLocation.trim();
@@ -261,6 +274,132 @@ export default class GHSyncPlugin extends Plugin {
 			trimmed: false,
 		};
 		return simpleGit(options).env(withoutGitHubTokenEnvironment(process.env));
+	}
+
+	private getHistoryGit(): DocumentHistoryGit {
+		const adapter = this.app.vault.adapter;
+		if (!(adapter instanceof FileSystemAdapter)) {
+			throw new Error('Document history requires a desktop vault stored on the local file system.');
+		}
+		const configuredLocation = this.settings.gitLocation.trim();
+		if (/[\r\n\0]/.test(configuredLocation)) {
+			throw new Error('The configured Git binary location is invalid.');
+		}
+		const binary = configuredLocation ? path.join(configuredLocation, 'git') : 'git';
+		const environment = {
+			...withoutGitHubTokenEnvironment(process.env),
+			GIT_NO_LAZY_FETCH: '1',
+			GIT_LITERAL_PATHSPECS: '1',
+			GIT_OPTIONAL_LOCKS: '0',
+		};
+		return {
+			raw: (args: string[]) => new Promise<string>((resolve, reject) => {
+				execFile(binary, args, {
+					cwd: adapter.getBasePath(),
+					env: environment,
+					encoding: 'utf8',
+					maxBuffer: 1024 * 1024,
+					timeout: 15_000,
+					windowsHide: true,
+				}, (error, stdout, stderr) => {
+					if (error) {
+						reject(new Error(stderr.trim() || error.message));
+						return;
+					}
+					resolve(stdout);
+				});
+			}),
+		};
+	}
+
+	private markdownViewForPath(filePath?: string): MarkdownView | undefined {
+		const active = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (active?.file && (!filePath || active.file.path === filePath)) return active;
+		for (const leaf of this.app.workspace.getLeavesOfType('markdown')) {
+			const view = leaf.view;
+			if (view instanceof MarkdownView && view.file && (!filePath || view.file.path === filePath)) return view;
+		}
+		return undefined;
+	}
+
+	getActiveDocumentPath(): string | undefined {
+		return this.markdownViewForPath()?.file?.path;
+	}
+
+	private documentRenameHistory(filePath: string): string[] {
+		const history: string[] = [];
+		const seen = new Set([filePath]);
+		let current = filePath;
+		for (let index = 0; index < 7; index += 1) {
+			const previous = this.settings.documentRenameHints[current];
+			if (!previous || seen.has(previous)) break;
+			history.push(previous);
+			seen.add(previous);
+			current = previous;
+		}
+		return history;
+	}
+
+	private async rememberDocumentRename(filePath: string, oldPath: string): Promise<void> {
+		if (this.syncInProgress || filePath === oldPath) return;
+		const hints = { ...this.settings.documentRenameHints, [filePath]: oldPath };
+		const entries = Object.entries(hints);
+		const capped: Record<string, string> = {};
+		for (const [nextPath, previousPath] of entries.slice(Math.max(0, entries.length - 200))) capped[nextPath] = previousPath;
+		this.settings.documentRenameHints = capped;
+		await this.saveSettings();
+		this.followDocumentHistorySurfaces(filePath);
+	}
+
+	async loadDocumentHistory(filePath: string, saveEditor = false): Promise<DocumentHistorySnapshot> {
+		if (this.syncInProgress) throw new Error('Git is updating. Document history will refresh when the operation finishes.');
+		const view = this.markdownViewForPath(filePath);
+		let contents = '';
+		if (view?.file) {
+			if (saveEditor) await view.save();
+			contents = view.getViewData();
+		} else {
+			contents = await this.app.vault.adapter.read(filePath).catch(() => '');
+		}
+		return new DocumentHistoryService(this.getHistoryGit()).load(filePath, contents, this.documentRenameHistory(filePath));
+	}
+
+	async loadDocumentVersionPatch(version: DocumentVersion): Promise<DocumentPatch> {
+		if (this.syncInProgress) throw new Error('Git is updating. Try the version again when the operation finishes.');
+		return new DocumentHistoryService(this.getHistoryGit()).loadVersionPatch(version.hash, version.path, version.previousPath);
+	}
+
+	async openDocumentHistory(filePath?: string): Promise<void> {
+		const pathToOpen = filePath ?? this.getActiveDocumentPath();
+		if (!pathToOpen) {
+			this.showNotice('Open a Markdown document to view its history.', 'WARNING');
+			return;
+		}
+		let leaf = this.app.workspace.getLeavesOfType(DOCUMENT_HISTORY_VIEW)[0];
+		if (!leaf) {
+			leaf = this.app.workspace.getRightLeaf(false) ?? this.app.workspace.getLeaf(true);
+			await leaf.setViewState({ type: DOCUMENT_HISTORY_VIEW, active: true });
+		}
+		const view = leaf.view;
+		if (view instanceof DocumentHistoryView) await view.showDocument(pathToOpen);
+		await this.app.workspace.revealLeaf(leaf);
+	}
+
+	private refreshDocumentHistorySurfaces(filePath?: string): void {
+		for (const leaf of this.app.workspace.getLeavesOfType(DOCUMENT_HISTORY_VIEW)) {
+			const view = leaf.view;
+			if (view instanceof DocumentHistoryView) {
+				if (filePath) void view.refreshIfDocument(filePath);
+				else void view.refresh();
+			}
+		}
+	}
+
+	private followDocumentHistorySurfaces(filePath: string): void {
+		for (const leaf of this.app.workspace.getLeavesOfType(DOCUMENT_HISTORY_VIEW)) {
+			const view = leaf.view;
+			if (view instanceof DocumentHistoryView) void view.followDocument(filePath);
+		}
 	}
 
 	private getGitHubCliExecutable(): string {
@@ -608,10 +747,12 @@ export default class GHSyncPlugin extends Plugin {
 
 	private renderHeaderBranchBadge(): void {
 		if (!this.displayedBranch) return;
-		const leaf = this.app.workspace.getMostRecentLeaf();
-		const titleContainer = leaf?.view.containerEl.querySelector('.view-header-title-container');
+		const markdownView = this.markdownViewForPath();
+		if (!markdownView?.file) return;
+		const titleContainer = markdownView.containerEl.querySelector('.view-header-title-container');
 		const header = titleContainer?.closest('.view-header');
 		if (!(header instanceof HTMLElement)) return;
+		this.headerDocumentPath = markdownView.file.path;
 
 		if (!this.headerBranchBadgeEl) {
 			const badge = document.createElement('button');
@@ -625,6 +766,17 @@ export default class GHSyncPlugin extends Plugin {
 			});
 			this.headerBranchBadgeEl = badge;
 			this.register(() => badge.remove());
+		}
+		if (!this.headerHistoryButtonEl) {
+			const history = document.createElement('button');
+			history.type = 'button';
+			history.addClass('clickable-icon', 'gh-sync-header-history');
+			setIcon(history, 'history');
+			history.setAttr('aria-label', 'Open history for this document');
+			history.setAttr('title', 'Document history');
+			this.registerDomEvent(history, 'click', () => void this.openDocumentHistory(this.headerDocumentPath));
+			this.headerHistoryButtonEl = history;
+			this.register(() => history.remove());
 		}
 
 		this.headerBranchBadgeEl.empty();
@@ -657,8 +809,13 @@ export default class GHSyncPlugin extends Plugin {
 		this.headerBranchBadgeEl.setAttr('title', `Current documentation branch: ${this.displayedBranch}.${stateDescription}${dirtyDescription}${conflictDescription} Click to manage branches.`);
 		this.headerBranchBadgeEl.setAttr('aria-label', `Current documentation branch: ${this.displayedBranch}.${stateDescription}${dirtyDescription}${conflictDescription} Open branch manager.`);
 		const actions = header.querySelector('.view-actions');
-		if (actions) header.insertBefore(this.headerBranchBadgeEl, actions);
-		else header.appendChild(this.headerBranchBadgeEl);
+		if (actions) {
+			header.insertBefore(this.headerBranchBadgeEl, actions);
+			header.insertBefore(this.headerHistoryButtonEl, actions);
+		} else {
+			header.appendChild(this.headerBranchBadgeEl);
+			header.appendChild(this.headerHistoryButtonEl);
+		}
 	}
 
 	private setOperationStatus(step?: string): void {
@@ -712,6 +869,7 @@ export default class GHSyncPlugin extends Plugin {
 			}
 		} finally {
 			this.syncInProgress = false;
+			this.refreshDocumentHistorySurfaces();
 		}
 	}
 
@@ -971,7 +1129,7 @@ export default class GHSyncPlugin extends Plugin {
 
 	async requestAISuggestion(request: Omit<ConflictAIRequest, 'branch'>): Promise<ConflictAISuggestion> {
 		const provider = this.settings.aiProvider;
-		if (provider === 'disabled') throw new Error('Enable an AI provider in GitHub Sync settings first.');
+		if (provider === 'disabled') throw new Error('Enable an AI provider in Document Versioning settings first.');
 		if (this.settings.aiConsentProvider !== provider) {
 			const approved = await new Promise<boolean>((resolve) => new AIConsentModal(this.app, provider, resolve).open());
 			if (!approved) throw new Error('AI suggestion cancelled.');
@@ -1267,6 +1425,7 @@ export default class GHSyncPlugin extends Plugin {
 		await this.loadSettings();
 		this.registerView(CONFLICT_CENTER_VIEW, (leaf) => new ConflictCenterView(leaf, this));
 		this.registerView(REVIEW_CENTER_VIEW, (leaf) => new ReviewCenterView(leaf, this));
+		this.registerView(DOCUMENT_HISTORY_VIEW, (leaf) => new DocumentHistoryView(leaf, this));
 		this.registerEditorExtension(conflictEditorExtension({
 			isConflictedFile: (filePath) => this.isConflictedFile(filePath),
 			onDocumentUpdated: (filePath, remaining) => this.onConflictDocumentUpdated(filePath, remaining),
@@ -1297,21 +1456,39 @@ export default class GHSyncPlugin extends Plugin {
 			}
 		});
 		this.registerEvent(this.app.workspace.on('active-leaf-change', () => {
-			window.setTimeout(() => this.renderHeaderBranchBadge(), 0);
+			window.setTimeout(() => {
+				this.renderHeaderBranchBadge();
+				const activePath = this.app.workspace.getActiveViewOfType(MarkdownView)?.file?.path;
+				if (activePath) this.followDocumentHistorySurfaces(activePath);
+			}, 0);
 		}));
 		this.registerEvent(this.app.workspace.on('layout-change', () => this.renderHeaderBranchBadge()));
 		this.registerEvent(this.app.workspace.on('editor-menu', (menu: Menu, editor: Editor, info) => {
-			if (!editor.getSelection()) return;
-			menu.addItem((item) => item
-				.setTitle('Comment on selection')
-				.setIcon('message-square-plus')
-				.onClick(() => void this.commentOnSelection(editor, info instanceof MarkdownView ? info : undefined)));
+			const markdownView = info instanceof MarkdownView ? info : undefined;
+			if (markdownView?.file) {
+				menu.addItem((item) => item
+					.setTitle('View document history')
+					.setIcon('history')
+					.onClick(() => void this.openDocumentHistory(markdownView.file?.path)));
+			}
+			if (editor.getSelection()) {
+				menu.addItem((item) => item
+					.setTitle('Comment on selection')
+					.setIcon('message-square-plus')
+					.onClick(() => void this.commentOnSelection(editor, markdownView)));
+			}
 		}));
-		this.registerEvent(this.app.vault.on('modify', () => {
+		this.registerEvent(this.app.vault.on('modify', (file) => {
 			if (this.dirtyRefreshTimer) window.clearTimeout(this.dirtyRefreshTimer);
 			this.dirtyRefreshTimer = window.setTimeout(() => {
-				if (!this.syncInProgress) void this.updateBranchStatus();
+				if (!this.syncInProgress) {
+					void this.updateBranchStatus();
+					this.refreshDocumentHistorySurfaces(file.path);
+				}
 			}, 350);
+		}));
+		this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
+			if (file instanceof TFile && file.extension === 'md') void this.rememberDocumentRename(file.path, oldPath);
 		}));
 
 		const ribbonIconEl = this.addRibbonIcon('github', 'Sync current branch', () => void this.syncNotes());
@@ -1331,6 +1508,15 @@ export default class GHSyncPlugin extends Plugin {
 		this.addCommand({ id: 'github-sync-branch-manager', name: 'Open branch manager', callback: () => this.openBranchManager() });
 		this.addCommand({ id: 'github-sync-conflict-center', name: 'Open conflict center', callback: () => void this.openConflictCenter() });
 		this.addCommand({ id: 'github-sync-review-center', name: 'Open review center', callback: () => void this.openReviewCenter() });
+		this.addCommand({
+			id: 'github-sync-document-history',
+			name: 'Open history for current document',
+			editorCheckCallback: (checking, _editor, view) => {
+				if (!(view instanceof MarkdownView) || !view.file) return false;
+				if (!checking) void this.openDocumentHistory(view.file.path);
+				return true;
+			},
+		});
 		this.addCommand({ id: 'github-sync-setup', name: 'Open GitHub connection setup', callback: () => void this.openGitHubSetup() });
 		this.addCommand({
 			id: 'github-sync-comment-selection',
@@ -1375,6 +1561,266 @@ export default class GHSyncPlugin extends Plugin {
 
 	async saveSettings(): Promise<void> {
 		await this.saveData(this.settings);
+	}
+}
+
+class DocumentHistoryView extends ItemView {
+	private filePath?: string;
+	private snapshot?: DocumentHistorySnapshot;
+	private error?: string;
+	private loading = false;
+	private requestId = 0;
+	private documentGeneration = 0;
+	private expandedVersionKey?: string;
+	private readonly patches = new Map<string, DocumentPatch>();
+	private readonly patchErrors = new Map<string, string>();
+	private loadingPatch?: string;
+
+	constructor(leaf: WorkspaceLeaf, private readonly plugin: GHSyncPlugin) {
+		super(leaf);
+	}
+
+	getViewType(): string { return DOCUMENT_HISTORY_VIEW; }
+	getDisplayText(): string { return 'Document history'; }
+	getIcon(): string { return 'history'; }
+
+	async onOpen(): Promise<void> {
+		const activePath = this.plugin.getActiveDocumentPath();
+		if (activePath) await this.showDocument(activePath);
+		else this.render();
+	}
+
+	async showDocument(filePath: string): Promise<void> {
+		const changed = this.filePath !== filePath;
+		this.filePath = filePath;
+		if (changed) {
+			this.documentGeneration += 1;
+			this.snapshot = undefined;
+			this.expandedVersionKey = undefined;
+			this.loadingPatch = undefined;
+			this.patches.clear();
+			this.patchErrors.clear();
+		}
+		await this.loadHistory(true);
+	}
+
+	async followDocument(filePath: string): Promise<void> {
+		if (this.filePath === filePath) return;
+		await this.showDocument(filePath);
+	}
+
+	async refreshIfDocument(filePath: string): Promise<void> {
+		if (this.filePath === filePath) await this.refresh();
+	}
+
+	async refresh(): Promise<void> {
+		if (!this.filePath) {
+			const activePath = this.plugin.getActiveDocumentPath();
+			if (!activePath) {
+				this.render();
+				return;
+			}
+			this.filePath = activePath;
+		}
+		await this.loadHistory(false);
+	}
+
+	private async loadHistory(saveEditor: boolean): Promise<void> {
+		if (!this.filePath) return;
+		const requestedPath = this.filePath;
+		const requestId = ++this.requestId;
+		this.loading = true;
+		this.error = undefined;
+		this.render();
+		try {
+			const snapshot = await this.plugin.loadDocumentHistory(requestedPath, saveEditor);
+			if (requestId !== this.requestId || requestedPath !== this.filePath) return;
+			this.patchErrors.clear();
+			this.snapshot = snapshot;
+		} catch (error) {
+			if (requestId !== this.requestId || requestedPath !== this.filePath) return;
+			this.error = redactSensitiveText(error);
+		} finally {
+			if (requestId === this.requestId && requestedPath === this.filePath) {
+				this.loading = false;
+				this.render();
+			}
+		}
+	}
+
+	private stateCopy(state: DocumentHistorySnapshot['local']['state']): { title: string; detail: string } {
+		switch (state) {
+			case 'clean': return { title: 'No local changes', detail: 'This document matches its latest saved version.' };
+			case 'untracked': return { title: 'New document — not synced yet', detail: 'This document has not been included in a saved Git version.' };
+			case 'conflicted': return { title: 'Document has a conflict', detail: 'Resolve the highlighted sections before syncing.' };
+			case 'renamed': return { title: 'Renamed locally — not synced yet', detail: 'The new document name has not been synchronized.' };
+			case 'staged': return { title: 'Local changes — ready to save', detail: 'These edits are staged locally but have not been synchronized.' };
+			case 'staged-and-modified': return { title: 'Local changes — not synced yet', detail: 'This document has both prepared and newer local edits.' };
+			default: return { title: 'Local changes — not synced yet', detail: 'These edits exist only on this computer until you sync.' };
+		}
+	}
+
+	private renderPatch(container: HTMLElement, patch: DocumentPatch, label: string): void {
+		if (!patch.text.trim()) {
+			container.createDiv({ cls: 'gh-sync-document-history__no-patch', text: 'No text changes to preview for this version.' });
+			return;
+		}
+		const patchEl = container.createEl('pre', {
+			cls: 'gh-sync-document-patch',
+			attr: { tabindex: '0', role: 'region', 'aria-label': label },
+		});
+		for (const line of patch.text.split('\n')) {
+			let cls = 'gh-sync-document-patch__line';
+			if (line.startsWith('+') && !line.startsWith('+++')) cls += ' is-addition';
+			else if (line.startsWith('-') && !line.startsWith('---')) cls += ' is-deletion';
+			else if (line.startsWith('@@')) cls += ' is-hunk';
+			else if (/^(?:diff --git|index |--- |\+\+\+ |…)/.test(line)) cls += ' is-meta';
+			patchEl.createSpan({ cls, text: line || ' ' });
+		}
+	}
+
+	private versionKey(version: DocumentVersion): string {
+		return `${version.hash}\0${version.path}\0${version.previousPath ?? ''}`;
+	}
+
+	private async toggleVersion(version: DocumentVersion): Promise<void> {
+		const key = this.versionKey(version);
+		if (this.expandedVersionKey === key) {
+			this.expandedVersionKey = undefined;
+			this.render();
+			return;
+		}
+		this.expandedVersionKey = key;
+		this.render();
+		if (this.patches.has(key) || this.patchErrors.has(key)) return;
+		const generation = this.documentGeneration;
+		const requestedPath = this.filePath;
+		this.loadingPatch = key;
+		this.render();
+		try {
+			const patch = await this.plugin.loadDocumentVersionPatch(version);
+			if (generation === this.documentGeneration && requestedPath === this.filePath) this.patches.set(key, patch);
+		} catch (error) {
+			if (generation === this.documentGeneration && requestedPath === this.filePath) this.patchErrors.set(key, redactSensitiveText(error));
+		} finally {
+			if (generation === this.documentGeneration && this.loadingPatch === key) this.loadingPatch = undefined;
+			if (generation === this.documentGeneration && this.expandedVersionKey === key) this.render();
+		}
+	}
+
+	private render(): void {
+		this.contentEl.empty();
+		this.contentEl.addClass('gh-sync-document-history');
+		this.contentEl.setAttr('aria-busy', String(this.loading));
+		this.contentEl.setAttr('aria-live', 'polite');
+		const header = this.contentEl.createDiv({ cls: 'gh-sync-document-history__header' });
+		const heading = header.createDiv({ cls: 'gh-sync-document-history__heading' });
+		heading.createEl('h3', { text: 'Document history' });
+		heading.createEl('p', { text: this.filePath ?? 'Open a Markdown document to inspect its changes.' });
+		const refresh = header.createEl('button', {
+			cls: 'clickable-icon',
+			attr: { type: 'button', 'aria-label': 'Refresh document history' },
+		});
+		setIcon(refresh, 'refresh-cw');
+		refresh.disabled = this.loading || !this.filePath;
+		refresh.addEventListener('click', () => {
+			if (!this.filePath) return;
+			void this.loadHistory(true);
+		});
+
+		if (!this.filePath) {
+			const empty = this.contentEl.createDiv({ cls: 'gh-sync-document-history__empty' });
+			setIcon(empty.createSpan(), 'file-clock');
+			empty.createDiv({ cls: 'gh-sync-document-history__empty-title', text: 'No document selected' });
+			empty.createEl('p', { text: 'Open a Markdown document, then use its history button.' });
+			return;
+		}
+		if (this.loading && !this.snapshot) {
+			const loading = this.contentEl.createDiv({ cls: 'gh-sync-document-history__empty' });
+			const icon = loading.createSpan({ cls: 'gh-sync-document-history__spinner' });
+			setIcon(icon, 'loader-circle');
+			loading.createDiv({ cls: 'gh-sync-document-history__empty-title', text: 'Loading document changes…' });
+			loading.createEl('p', { text: 'Reading local Git history. GitHub is not contacted.' });
+			return;
+		}
+		if (this.error && !this.snapshot) {
+			const error = this.contentEl.createDiv({ cls: 'gh-sync-document-history__empty is-error' });
+			setIcon(error.createSpan(), 'circle-alert');
+			error.createDiv({ cls: 'gh-sync-document-history__empty-title', text: 'Could not read document history' });
+			error.createEl('p', { text: this.error });
+			return;
+		}
+		const snapshot = this.snapshot;
+		if (!snapshot) return;
+
+		const context = this.contentEl.createDiv({ cls: 'gh-sync-document-history__context' });
+		setIcon(context.createSpan(), 'git-branch');
+		context.createSpan({ text: snapshot.branch });
+		context.createSpan({ cls: 'gh-sync-document-history__offline', text: 'Local history' });
+		if (this.error) {
+			const warning = this.contentEl.createDiv({ cls: 'gh-sync-document-history__warning', attr: { role: 'status' } });
+			setIcon(warning.createSpan(), 'circle-alert');
+			warning.createSpan({ text: `Showing the last loaded history. Refresh failed: ${this.error}` });
+		}
+
+		const localCopy = this.stateCopy(snapshot.local.state);
+		const local = this.contentEl.createDiv({ cls: `gh-sync-document-history__local is-${snapshot.local.state}` });
+		const localHeader = local.createDiv({ cls: 'gh-sync-document-history__local-header' });
+		const localIcon = localHeader.createSpan({ cls: 'gh-sync-document-history__local-icon' });
+		setIcon(localIcon, snapshot.local.state === 'clean' ? 'circle-check' : snapshot.local.state === 'conflicted' ? 'triangle-alert' : 'file-pen-line');
+		const localCopyEl = localHeader.createDiv({ cls: 'gh-sync-document-history__local-copy' });
+		localCopyEl.createDiv({ cls: 'gh-sync-document-history__local-title', text: localCopy.title });
+		localCopyEl.createDiv({ cls: 'gh-sync-document-history__local-detail', text: localCopy.detail });
+		if (snapshot.local.state !== 'clean') {
+			const stats = localHeader.createDiv({ cls: 'gh-sync-document-history__stats' });
+			if (snapshot.local.patch.additions > 0) stats.createSpan({ cls: 'is-addition', text: `+${snapshot.local.patch.additions}` });
+			if (snapshot.local.patch.deletions > 0) stats.createSpan({ cls: 'is-deletion', text: `−${snapshot.local.patch.deletions}` });
+		}
+		if (snapshot.local.state !== 'clean') this.renderPatch(local, snapshot.local.patch, 'Current local document changes');
+
+		const versionsHeader = this.contentEl.createDiv({ cls: 'gh-sync-document-history__versions-header' });
+		versionsHeader.createEl('h4', { text: 'Saved versions' });
+		versionsHeader.createSpan({ text: String(snapshot.versions.length) });
+		if (snapshot.versions.length === 0) {
+			this.contentEl.createDiv({ cls: 'gh-sync-document-history__no-versions', text: 'This document has no committed versions yet.' });
+			return;
+		}
+
+		const list = this.contentEl.createDiv({ cls: 'gh-sync-document-history__versions' });
+		for (const version of snapshot.versions) {
+			const key = this.versionKey(version);
+			const item = list.createDiv({ cls: `gh-sync-document-version${this.expandedVersionKey === key ? ' is-expanded' : ''}` });
+			const button = item.createEl('button', {
+				cls: 'gh-sync-document-version__button',
+				attr: { type: 'button', 'aria-expanded': String(this.expandedVersionKey === key) },
+			});
+			const icon = button.createSpan({ cls: 'gh-sync-document-version__icon' });
+			setIcon(icon, this.expandedVersionKey === key ? 'chevron-down' : 'chevron-right');
+			const copy = button.createDiv({ cls: 'gh-sync-document-version__copy' });
+			copy.createDiv({ cls: 'gh-sync-document-version__subject', text: version.subject });
+			const timestamp = Number.isNaN(Date.parse(version.timestamp)) ? version.timestamp : new Date(version.timestamp).toLocaleString();
+			copy.createDiv({ cls: 'gh-sync-document-version__meta', text: `${version.author} · ${timestamp}` });
+			const badges = button.createDiv({ cls: 'gh-sync-document-version__badges' });
+			if (version.localOnly) badges.createSpan({ cls: 'is-local', text: 'Not pushed yet' });
+			if (version.additions > 0) badges.createSpan({ cls: 'is-addition', text: `+${version.additions}` });
+			if (version.deletions > 0) badges.createSpan({ cls: 'is-deletion', text: `−${version.deletions}` });
+			button.addEventListener('click', () => void this.toggleVersion(version));
+
+			if (this.expandedVersionKey === key) {
+				const detail = item.createDiv({ cls: 'gh-sync-document-version__detail' });
+				detail.createDiv({ cls: 'gh-sync-document-version__detail-title', text: 'What changed in this version' });
+				if (this.loadingPatch === key) {
+					const loading = detail.createDiv({ cls: 'gh-sync-document-version__loading' });
+					setIcon(loading.createSpan({ cls: 'gh-sync-document-history__spinner' }), 'loader-circle');
+					loading.createSpan({ text: 'Loading version…' });
+				} else if (this.patchErrors.has(key)) {
+					detail.createDiv({ cls: 'gh-sync-document-version__error', text: this.patchErrors.get(key) });
+				} else {
+					const patch = this.patches.get(key);
+					if (patch) this.renderPatch(detail, patch, `Changes saved in ${version.subject}`);
+				}
+			}
+		}
 	}
 }
 

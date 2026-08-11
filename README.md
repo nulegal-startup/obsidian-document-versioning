@@ -1,8 +1,8 @@
-# GitHub Sync for Obsidian — Branch Workflow Fork
+# NuLegal Document Versioning for Obsidian
 
-This fork adds a non-technical, branch-based documentation workflow to Kevin Chin's original [Obsidian GitHub Sync](https://github.com/kevinmkchin/Obsidian-GitHub-Sync) plugin.
+NuLegal Document Versioning gives non-technical teams a branch-based workflow for planning, reviewing, and versioning internal Obsidian documentation with GitHub.
 
-## What this fork adds
+## What it provides
 
 - Start a documentation change from the latest accepted branch.
 - Generate safe branch names such as `changes/next-sprint-billing` from human-readable titles.
@@ -17,6 +17,8 @@ This fork adds a non-technical, branch-based documentation workflow to Kevin Chi
 - Keep errors and action-needed states visible long enough to understand what happened.
 - Follow Obsidian's live light/dark appearance when its base color scheme adapts to the system.
 - Show the current branch as a clickable badge in the active note header and status bar.
+- Open a read-only **Document history** panel from the clock button beside the branch badge.
+- Show current local edits before the document's committed versions, including commits that have not been pushed yet.
 - Display deterministic `ahead`, `behind`, `diverged`, `up to date`, and `not published` branch states.
 - Fast-forward clean remote-only updates through an explicit **Update branch** action.
 - Require **Sync current** when local edits or commits must be saved, merged, or pushed.
@@ -39,7 +41,7 @@ This fork adds a non-technical, branch-based documentation workflow to Kevin Chi
 2. Enter a short change name, such as `Next sprint billing`.
 3. The plugin publishes the branch and creates its draft review immediately; no Markdown file is changed by the lifecycle commit.
 4. Select text and use **Comment on selected text** whenever a decision needs discussion, even before the first document edit.
-5. Edit notes normally, then choose **GitHub Sync: Sync current branch** or click the GitHub ribbon icon.
+5. Edit notes normally, then choose **Document Versioning: Sync current branch** or click the GitHub ribbon icon.
 6. After the pull request is merged, use **Return to main** in the branch manager.
 
 The branch manager also lists existing local and GitHub branches. Switching is allowed only when the current branch is clean and synchronized, preventing uncommitted edits from being silently carried between changes.
@@ -51,6 +53,20 @@ Git operations run in the background with a non-blocking activity card. Complete
 The branch badge uses `↓N` for remote commits not yet pulled, `↑N` for local commits not yet pushed, and both when histories have diverged. Opening the Branch Manager refreshes this state from GitHub. A clean branch that is only behind can be fast-forwarded with **Update branch**; branches with local work use **Sync current** so the remote history is merged without force-pushing.
 
 The default accepted branch is `main`, and the default change prefix is `changes`.
+
+## Document history
+
+Open any Markdown document and click the clock button beside its branch badge, use **View document history** in the editor menu, or run **Open history for current document** from the command palette.
+
+The panel saves the current Obsidian editor buffer locally, then shows:
+
+- **Local changes — not synced yet**, with added and removed lines compared with the latest committed version;
+- new, renamed, staged, or conflicted document states in non-technical language;
+- up to 50 committed versions affecting only that document, following committed file renames;
+- each version's author, time, summary, and a **Not pushed yet** label for local-only commits; and
+- a bounded, expandable line-by-line preview with additions and deletions for each saved version.
+
+Document history is read-only and uses only the vault's local Git data. Opening or refreshing it never fetches, pushes, contacts GitHub, or requires GitHub authentication. Large and binary changes receive a safe summary instead of rendering unbounded content. Restoring an old version is intentionally not included because that action can overwrite work or create conflicts.
 
 ## Setup
 
@@ -117,7 +133,7 @@ Copy `main.js`, `manifest.json`, and `styles.css` into:
 <vault>/.obsidian/plugins/github-sync/
 ```
 
-Then reload Obsidian and enable **GitHub Sync** under Community Plugins.
+Then reload Obsidian and enable **Document Versioning** under Community Plugins.
 
 ## Security notes
 
@@ -129,8 +145,4 @@ Then reload Obsidian and enable **GitHub Sync** under Community Plugins.
 - GitHub review requests also use argument arrays without a shell; comment content is bounded and credentials are delegated to the GitHub CLI.
 - Production dependencies and the development toolchain are checked with `npm audit`.
 
-See [SECURITY_REVIEW.md](SECURITY_REVIEW.md) for the focused review performed for this fork.
-
-## Attribution
-
-Maintained by [NuLegal](https://github.com/nulegal-startup). Originally created by [Kevin Chin](https://github.com/kevinmkchin); this fork remains under the repository's MIT license.
+See [SECURITY_REVIEW.md](SECURITY_REVIEW.md) for the focused security review. The plugin is maintained by [NuLegal](https://github.com/nulegal-startup).
