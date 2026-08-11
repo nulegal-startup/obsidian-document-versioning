@@ -5,30 +5,99 @@ on:
     tags:
       - "*"
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
+      - name: Check out the tagged source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require a commit reviewed on main
+        run: |
+          git fetch origin main --no-tags
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
 
       - name: Use Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: "18.x"
+          node-version: "22.x"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test plugin
+        run: npm test
 
       - name: Build plugin
-        run: |
-          npm install
-          npm run build
+        run: npm run build
 
-      - name: Create release
+      - name: Verify release version
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          tag="${GITHUB_REF#refs/tags/}"
+          if [[ ! "$RELEASE_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tag must be strict semantic versioning." >&2
+            exit 1
+          fi
+          node -e 'const manifest = require("./manifest.json"); if (manifest.version !== process.env.RELEASE_TAG) { throw new Error(`Tag ${process.env.RELEASE_TAG} does not match manifest ${manifest.version}`); }'
 
-          gh release create "$tag" \
-            --title="$tag" \
-            --draft \
-            main.js manifest.json styles.css
+      - name: Create checksums
+        run: sha256sum main.js manifest.json styles.css > checksums.txt
+
+      - name: Upload verified release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: plugin-release-${{ github.run_id }}
+          path: |
+            main.js
+            manifest.json
+            styles.css
+            checksums.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download verified release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: plugin-release-${{ github.run_id }}
+          path: release-dist
+
+      - name: Publish release
+        working-directory: release-dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tag must be strict semantic versioning." >&2
+            exit 1
+          fi
+          for asset in main.js manifest.json styles.css checksums.txt; do
+            test -f "$asset"
+          done
+          gh release create "$RELEASE_TAG" \
+            --repo "$RELEASE_REPOSITORY" \
+            --verify-tag \
+            --title "$RELEASE_TAG" \
+            --generate-notes \
+            main.js \
+            manifest.json \
+            styles.css \
+            checksums.txt
