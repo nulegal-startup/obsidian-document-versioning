@@ -101,6 +101,8 @@ test('browser authentication ignores temporary token environment variables', () 
 		GITHUB_TOKEN: 'secret-two',
 		GH_ENTERPRISE_TOKEN: 'secret-three',
 		GITHUB_ENTERPRISE_TOKEN: 'secret-four',
+		GIT_PAGER: 'cat',
+		PAGER: 'cat',
 	});
 	assert.deepEqual(clean, { PATH: '/usr/bin' });
 });
