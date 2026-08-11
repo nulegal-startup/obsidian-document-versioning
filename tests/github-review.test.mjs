@@ -14,6 +14,13 @@ test('parses supported GitHub HTTPS and SSH remotes', () => {
 	assert.throws(() => github.parseGitHubRepository('https://gitlab.com/acme/docs.git'));
 });
 
+test('checks only the active GitHub account', async () => {
+	const calls = [];
+	const client = new github.GitHubReviewClient('gh', async (args) => { calls.push(args); return ''; });
+	await client.assertAuthenticated();
+	assert.deepEqual(calls, [['auth', 'status', '--active', '--hostname', 'github.com']]);
+});
+
 test('reuses an existing draft PR without creating another', async () => {
 	const calls = [];
 	const client = new github.GitHubReviewClient('gh', async (args) => {

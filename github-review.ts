@@ -1,6 +1,7 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { TextAnchor, ReviewMetadata, decodeReviewMetadata, encodeReviewMetadata, visibleCommentBody } from './review-anchor';
+import { withoutGitHubTokenEnvironment } from './github-auth';
 
 const execFileAsync = promisify(execFile);
 
@@ -36,17 +37,20 @@ export class GitHubReviewClient {
 				timeout: 30000,
 				maxBuffer: 2 * 1024 * 1024,
 				windowsHide: true,
+				env: withoutGitHubTokenEnvironment(process.env),
 			});
 			return stdout;
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			if (/ENOENT|not found/i.test(message)) throw new Error('Install the GitHub CLI (gh) to use review comments.');
-			throw new Error(message.replace(/\b(?:ghp|github_pat)_[A-Za-z0-9_]+\b/g, '[REDACTED]'));
+			throw new Error(message
+				.replace(/\b(?:ghp|github_pat|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{10,}\b/g, '[REDACTED]')
+				.replace(/(https?:\/\/)[^/@\s]+@/gi, '$1[REDACTED]@'));
 		}
 	}
 
 	async assertAuthenticated(): Promise<void> {
-		await this.run(['auth', 'status', '--hostname', 'github.com']);
+		await this.run(['auth', 'status', '--active', '--hostname', 'github.com']);
 	}
 
 	async ensureDraftPR(repository: GitHubRepository, head: string, base: string, title?: string): Promise<PullRequestInfo> {

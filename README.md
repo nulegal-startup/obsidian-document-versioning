@@ -25,6 +25,8 @@ This fork adds a non-technical, branch-based documentation workflow to Kevin Chi
 - Keep a workspace-wide Conflict Center with document and section counts.
 - Offer review-only Codex, Ollama, or LM Studio suggestions for one conflict at a time.
 - Create or reuse a draft GitHub pull request when a change branch is published.
+- Make a clean new branch reviewable immediately with a content-free lifecycle commit, so comments work before the first document edit.
+- Guide GitHub browser login inside Obsidian with clear app, account, and private-repository checks.
 - Show a visible **Comment** control beside selected text and attach the discussion without changing the Markdown document.
 - Autocomplete repository collaborators as the author types `@`, plus replies, resolve/reopen, and a workspace Review Center.
 - Autocomplete the same GitHub collaborators when an editor types `@` directly in a Markdown document.
@@ -35,9 +37,9 @@ This fork adds a non-technical, branch-based documentation workflow to Kevin Chi
 
 1. Click **Git: main** in the status bar or the branch ribbon icon to open the branch manager.
 2. Enter a short change name, such as `Next sprint billing`.
-3. Edit notes normally in Obsidian.
-4. Choose **GitHub Sync: Sync current branch** or click the GitHub ribbon icon.
-5. Select text and use **Comment on selected text** when a decision needs discussion; the draft review is created automatically.
+3. The plugin publishes the branch and creates its draft review immediately; no Markdown file is changed by the lifecycle commit.
+4. Select text and use **Comment on selected text** whenever a decision needs discussion, even before the first document edit.
+5. Edit notes normally, then choose **GitHub Sync: Sync current branch** or click the GitHub ribbon icon.
 6. After the pull request is merged, use **Return to main** in the branch manager.
 
 The branch manager also lists existing local and GitHub branches. Switching is allowed only when the current branch is clean and synchronized, preventing uncommitted edits from being silently carried between changes.
@@ -52,26 +54,29 @@ The default accepted branch is `main`, and the default change prefix is `changes
 
 ## Setup
 
-Your Obsidian vault must already be a Git repository with an `origin` remote. Configure these plugin settings:
+For the managed NuLegal vault, use the repository's double-click installer. It installs Obsidian and the required helpers, clones the private vault, installs this plugin, and opens GitHub's browser/device approval. Users do not need to create SSH keys, paste tokens, or type Git commands.
 
-- **Remote URL:** an HTTPS URL without credentials, or an SSH URL.
+On first launch, the plugin opens **Connect documentation to GitHub**. It checks Git, the vault remote, the active account, and repository access. Choose **Connect GitHub** to approve in the browser. If GitHub requests a one-time code, paste it—the helper already copied it. GitHub CLI manages the saved credential and normally uses the operating system credential store; the UI warns when the CLI reports plaintext fallback. The connection is reused across browser, Obsidian, and computer restarts. The plugin never starts login solely because the network is temporarily unavailable.
+
+For a manually prepared vault, configure these plugin settings:
+
+- **Remote URL:** a credential-free HTTPS URL.
 - **Base branch:** normally `main`.
 - **Protect base branch:** keep enabled to prevent direct commits to `main`.
 - **Change branch prefix:** normally `changes`.
-- **Git binary location:** leave empty when Git is available on your system path.
+- **Git binary location:** an advanced repair option; the managed installer configures Git automatically.
 - **Create draft review automatically:** keep enabled to connect each published change branch to one draft pull request.
-- **GitHub CLI executable:** leave empty when `gh` is on `PATH`; run `gh auth login` once on each editor's computer.
+- **GitHub CLI executable:** an advanced repair option; use the in-plugin GitHub connection screen for browser login.
 - **AI provider:** optional; disabled by default. Codex uses the local Codex CLI login, while Ollama and LM Studio use a local model server through the Codex CLI.
 - **Codex executable:** optional full path; leave empty to use the ChatGPT app copy or `codex` on `PATH`.
 
-Examples of accepted remotes:
+Recommended remote:
 
 ```text
 https://github.com/your-organization/docs.git
-git@github.com:your-organization/docs.git
 ```
 
-Do not embed a GitHub token in the remote URL. Use SSH or Git Credential Manager.
+Do not embed a GitHub token in the remote URL. The guided connection uses GitHub CLI as the HTTPS credential helper.
 
 ## Selected-text review behavior
 
@@ -81,7 +86,7 @@ The **Documentation review** side panel groups replies into threads and lets edi
 
 Typing `@` directly in a Markdown document also opens the collaborator picker and inserts the chosen `@username` into the file. This is durable document content and is versioned with Git. GitHub only sends mention notifications from the pull-request discussion; a username written inside a repository file is intentionally not posted or notified automatically.
 
-Review comments require a GitHub account with repository access and an authenticated GitHub CLI. The plugin never stores a GitHub token. Failure to create or refresh a review does not block Git commits, pulls, or pushes.
+Review comments require a GitHub account with repository access. The guided browser flow authenticates GitHub CLI, which keeps its credential in the system credential store; the plugin never reads or stores the token. A six-hour browser session does not imply a six-hour plugin login. Reconnection is only expected after GitHub revokes access or an organization changes its authentication policy. Failure to create or refresh a review does not block local editing.
 
 ## Conflict behavior
 

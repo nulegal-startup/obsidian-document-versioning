@@ -20,6 +20,17 @@ import { GitHubRepository, GitHubReviewClient, GitHubReviewComment, PullRequestI
 import { reviewEditorExtension } from './review-editor';
 import { applyMention, matchingMentions, mentionQueryAt, MentionQuery } from './review-mention';
 import { DocumentMentionSuggest } from './document-mention';
+import { activateReviewCenter, ReviewRefreshGate } from './review-refresh';
+import {
+	classifyGitHubConnectionError,
+	githubHttpsRemote,
+	GitHubAuthClient,
+	GitHubConnectionProblem,
+	isGitHubCredentialSetupError,
+	withoutGitHubTokenEnvironment,
+} from './github-auth';
+import { createReviewReadyCommit } from './start-change';
+import { configureMatchingGitHubOrigin, hasEffectiveGitHubCredentialHelper, requireMatchingGitHubOrigin } from './github-vault';
 
 type NoticeLevelSetting = 'ALL' | 'WARNING' | 'ERROR';
 type LegacyNoticeLevelSetting = NoticeLevelSetting | 'WARNINGS';
@@ -41,6 +52,7 @@ interface GHSyncSettings {
 	aiConsentProvider: ConflictAIProvider;
 	githubCliPath: string;
 	autoCreateDraftPR: boolean;
+	setupAssistantSeen: boolean;
 }
 
 const DEFAULT_SETTINGS: GHSyncSettings = {
@@ -59,6 +71,7 @@ const DEFAULT_SETTINGS: GHSyncSettings = {
 	aiConsentProvider: 'disabled',
 	githubCliPath: '',
 	autoCreateDraftPR: true,
+	setupAssistantSeen: false,
 };
 
 const CONFLICT_CENTER_VIEW = 'github-sync-conflict-center';
@@ -76,6 +89,19 @@ interface BranchSnapshot {
 	branches: string[];
 	sync: BranchSyncSummary;
 	isClean: boolean;
+}
+
+interface GitHubSetupReadiness {
+	gitReady: boolean;
+	vaultRepairable: boolean;
+	vaultReady: boolean;
+	vaultDetail: string;
+	connection: 'connected' | GitHubConnectionProblem;
+	login?: string;
+	repository?: string;
+	detail: string;
+	warning?: string;
+	ready: boolean;
 }
 
 type OperationResult = {
@@ -197,8 +223,11 @@ export default class GHSyncPlugin extends Plugin {
 	private dirtyRefreshTimer?: number;
 	private readonly gitControlEls: HTMLElement[] = [];
 	private reviewSnapshot?: ReviewSnapshot;
+	private readonly reviewRefresh = new ReviewRefreshGate<void>();
+	private requestedReviewBranch?: string;
 	private collaboratorCache?: { users: string[]; expiresAt: number };
 	private collaboratorRequest?: Promise<string[]>;
+	private githubConnectionRequest?: Promise<GitHubSetupReadiness>;
 
 	private shouldShowNotice(severity: NoticeSeverity): boolean {
 		switch (this.settings.noticeLevel) {
@@ -231,18 +260,192 @@ export default class GHSyncPlugin extends Plugin {
 			maxConcurrentProcesses: 1,
 			trimmed: false,
 		};
-		return simpleGit(options);
+		return simpleGit(options).env(withoutGitHubTokenEnvironment(process.env));
 	}
 
-	private getReviewClient(): GitHubReviewClient {
+	private getGitHubCliExecutable(): string {
 		const configured = this.settings.githubCliPath.trim();
 		const homebrewExecutable = ['/opt/homebrew/bin/gh', '/usr/local/bin/gh'].find((candidate) => fs.existsSync(candidate));
 		const executable = configured || homebrewExecutable || 'gh';
 		if (/[\r\n\0]/.test(executable)) throw new Error('The configured GitHub CLI path is invalid.');
-		return new GitHubReviewClient(executable);
+		return executable;
 	}
 
-	private async ensureReview(branch?: string): Promise<ReviewSnapshot> {
+	private getReviewClient(): GitHubReviewClient {
+		return new GitHubReviewClient(this.getGitHubCliExecutable());
+	}
+
+	private getAuthClient(): GitHubAuthClient {
+		return new GitHubAuthClient(this.getGitHubCliExecutable());
+	}
+
+	private async ensureGitIdentity(git: SimpleGit): Promise<void> {
+		const [name, email] = await Promise.all([
+			git.raw(['config', '--get', 'user.name']).catch(() => ''),
+			git.raw(['config', '--get', 'user.email']).catch(() => ''),
+		]);
+		if (name.trim() && email.trim()) return;
+		const identity = await this.getAuthClient().authenticatedIdentity();
+		if (!name.trim()) await git.raw(['config', '--local', 'user.name', identity.name]);
+		if (!email.trim()) {
+			const authorEmail = identity.email || `${identity.id}+${identity.login}@users.noreply.github.com`;
+			await git.raw(['config', '--local', 'user.email', authorEmail]);
+		}
+	}
+
+	async getGitHubSetupReadiness(): Promise<GitHubSetupReadiness> {
+		let repository: GitHubRepository;
+		try {
+			repository = parseGitHubRepository(this.settings.remoteURL);
+			githubHttpsRemote(repository);
+		} catch {
+			return {
+				gitReady: false,
+				vaultRepairable: false,
+				vaultReady: false,
+				vaultDetail: 'The documentation repository is not configured yet. Run the NuLegal Docs installer.',
+				connection: 'unknown',
+				detail: 'The documentation repository is not configured yet. Run the NuLegal Docs installer.',
+				ready: false,
+			};
+		}
+
+		let gitReady = false;
+		let vaultRepairable = false;
+		let vaultReady = false;
+		let vaultDetail = 'Run the NuLegal Docs installer to prepare this folder.';
+		try {
+			const git = this.getGit();
+			await git.raw(['--version']);
+			gitReady = true;
+			const origin = await requireMatchingGitHubOrigin(git, repository);
+			vaultRepairable = true;
+			const [name, email] = await Promise.all([
+				git.raw(['config', '--get', 'user.name']).catch(() => ''),
+				git.raw(['config', '--get', 'user.email']).catch(() => ''),
+			]);
+			if (!name.trim() || !email.trim()) {
+				vaultDetail = 'Git author details are missing. Finish GitHub setup to add them safely.';
+			} else if (origin.fetch !== githubHttpsRemote(repository) || origin.push !== githubHttpsRemote(repository)) {
+				vaultDetail = 'Finish setup to switch this vault from SSH to passwordless HTTPS.';
+			} else if (!(await hasEffectiveGitHubCredentialHelper(git))) {
+				vaultDetail = 'GitHub is connected, but passwordless Git access needs repair. Choose Finish setup.';
+			} else {
+				vaultReady = true;
+				vaultDetail = 'The documentation vault and passwordless HTTPS remote are ready.';
+			}
+		} catch (error) {
+			vaultDetail = `The documentation vault needs attention: ${redactSensitiveText(error)}`;
+		}
+
+		let login: string | undefined;
+		try {
+			const client = this.getAuthClient();
+			login = await client.authenticatedLogin();
+			await client.assertRepositoryAccess(repository);
+			if (!gitReady || !vaultReady) {
+				return {
+					gitReady,
+					vaultRepairable,
+					vaultReady,
+					vaultDetail,
+					connection: 'connected',
+					login,
+					repository: `${repository.owner}/${repository.repo}`,
+					detail: `Connected as @${login}.`,
+					ready: false,
+				};
+			}
+			return {
+				gitReady: true,
+				vaultRepairable: true,
+				vaultReady: true,
+				vaultDetail,
+				connection: 'connected',
+				login,
+				repository: `${repository.owner}/${repository.repo}`,
+				detail: `Connected as @${login}. GitHub CLI manages the saved credential.`,
+				ready: true,
+			};
+		} catch (error) {
+			const problem = classifyGitHubConnectionError(error);
+			return {
+				gitReady,
+				vaultRepairable,
+				vaultReady,
+				vaultDetail,
+				connection: problem.kind,
+				login,
+				repository: `${repository.owner}/${repository.repo}`,
+				detail: problem.message,
+				ready: false,
+			};
+		}
+	}
+
+	async connectGitHubInBrowser(signal?: AbortSignal): Promise<GitHubSetupReadiness> {
+		if (this.githubConnectionRequest) return this.githubConnectionRequest;
+		const request = this.performGitHubBrowserConnection(signal);
+		this.githubConnectionRequest = request;
+		try {
+			return await request;
+		} finally {
+			if (this.githubConnectionRequest === request) this.githubConnectionRequest = undefined;
+		}
+	}
+
+	private async performGitHubBrowserConnection(signal?: AbortSignal): Promise<GitHubSetupReadiness> {
+		const repository = parseGitHubRepository(this.settings.remoteURL);
+		const client = this.getAuthClient();
+		const connection = await client.connectWithBrowser(signal);
+		await client.assertRepositoryAccess(repository);
+		const checked = await this.getGitHubSetupReadiness();
+		const readiness = checked.vaultRepairable ? await this.finishGitHubSetup() : checked;
+		if (connection.storage === 'plaintext') {
+			return {
+				...readiness,
+				warning: 'GitHub CLI could not use the system credential store and reported plaintext fallback. Ask a workspace administrator to repair Keychain before using this computer for private documentation.',
+			};
+		}
+		return readiness;
+	}
+
+	async finishGitHubSetup(): Promise<GitHubSetupReadiness> {
+		const repository = parseGitHubRepository(this.settings.remoteURL);
+		const httpsRemote = githubHttpsRemote(repository);
+		const client = this.getAuthClient();
+		await client.authenticatedLogin();
+		await client.assertRepositoryAccess(repository);
+		const git = this.getGit();
+		await requireMatchingGitHubOrigin(git, repository);
+		await client.setupGitCredentialHelper();
+		const previousRemote = this.settings.remoteURL;
+		this.settings.remoteURL = httpsRemote;
+		try {
+			await this.configureRemote(git);
+			await this.ensureGitIdentity(git);
+			await this.saveSettings();
+			await this.updateBranchStatus(git);
+		} catch (error) {
+			this.settings.remoteURL = previousRemote;
+			throw error;
+		}
+		this.collaboratorCache = undefined;
+		return this.getGitHubSetupReadiness();
+	}
+
+	async completeGitHubSetup(): Promise<void> {
+		if (!this.settings.setupAssistantSeen) {
+			this.settings.setupAssistantSeen = true;
+			await this.saveSettings();
+		}
+	}
+
+	openGitHubSetup(): void {
+		new GitHubSetupModal(this.app, this).open();
+	}
+
+	private async loadReview(branch?: string): Promise<ReviewSnapshot> {
 		const git = this.getGit();
 		await this.configureRemote(git);
 		const current = branch ?? await this.currentBranch(git);
@@ -252,9 +455,18 @@ export default class GHSyncPlugin extends Plugin {
 		await client.assertAuthenticated();
 		const pull = await client.ensureDraftPR(repository, current, this.getBaseBranch());
 		const comments = await client.listComments(repository, pull.number);
-		this.reviewSnapshot = { repository, pull, comments };
+		return { repository, pull, comments };
+	}
+
+	private applyReviewSnapshot(snapshot: ReviewSnapshot): void {
+		this.reviewSnapshot = snapshot;
 		this.refreshReviewSurfaces();
-		return this.reviewSnapshot;
+	}
+
+	private async ensureReview(branch?: string): Promise<ReviewSnapshot> {
+		const snapshot = await this.loadReview(branch);
+		this.applyReviewSnapshot(snapshot);
+		return snapshot;
 	}
 
 	private async ensureReviewAfterPush(branch: string): Promise<string | undefined> {
@@ -263,6 +475,7 @@ export default class GHSyncPlugin extends Plugin {
 			const snapshot = await this.ensureReview(branch);
 			return ` · review #${snapshot.pull.number}`;
 		} catch (error) {
+			this.showReviewError(error);
 			this.showNotice(`Branch synced, but review setup needs attention: ${redactSensitiveText(error)}`, 'WARNING', 12000);
 			return undefined;
 		}
@@ -300,12 +513,8 @@ export default class GHSyncPlugin extends Plugin {
 
 	private async configureRemote(git: SimpleGit): Promise<void> {
 		const remote = validateRemoteUrl(this.settings.remoteURL);
-		const remotes = await git.getRemotes(true);
-		if (remotes.some((item) => item.name === 'origin')) {
-			await git.remote(['set-url', 'origin', remote]);
-		} else {
-			await git.addRemote('origin', remote);
-		}
+		const repository = parseGitHubRepository(remote);
+		await configureMatchingGitHubOrigin(git, repository, remote);
 	}
 
 	private async currentBranch(git: SimpleGit): Promise<string> {
@@ -364,12 +573,14 @@ export default class GHSyncPlugin extends Plugin {
 		try {
 			const gitInstance = git ?? this.getGit();
 			const branch = await this.currentBranch(gitInstance);
+			const branchChanged = Boolean(this.displayedBranch && branch !== this.displayedBranch);
 			const status = await gitInstance.status();
 			this.displayedDirty = !status.isClean();
 			await this.setConflictFiles(status.conflicted);
 			if (branch !== this.displayedBranch && !sync) this.displayedSync = undefined;
 			this.displayedBranch = branch;
 			if (sync) this.displayedSync = sync;
+			if (branchChanged) this.selectReviewBranch(branch);
 			this.branchStatusEl.empty();
 			const icon = this.branchStatusEl.createSpan({ cls: 'gh-sync-status__icon' });
 			setIcon(icon, 'git-branch');
@@ -490,7 +701,15 @@ export default class GHSyncPlugin extends Plugin {
 		try {
 			progress.complete(await action(progress), showSuccess);
 		} catch (error) {
-			progress.fail(error);
+			if (isGitHubCredentialSetupError(error)) {
+				progress.complete({
+					status: 'warning',
+					message: 'GitHub access needs setup. Reconnect the account or repair Git access to continue.',
+				});
+				this.openGitHubSetup();
+			} else {
+				progress.fail(error);
+			}
 		} finally {
 			this.syncInProgress = false;
 		}
@@ -507,6 +726,7 @@ export default class GHSyncPlugin extends Plugin {
 		if (currentStatus.conflicted.length > 0) {
 			throw new Error('Resolve the existing merge conflicts before syncing.');
 		}
+		await this.ensureGitIdentity(git);
 		await git.add(['-A']);
 		await git.commit(this.commitMessage());
 		return true;
@@ -589,21 +809,52 @@ export default class GHSyncPlugin extends Plugin {
 		this.renderHeaderBranchBadge();
 	}
 
+	private selectReviewBranch(branch: string, scheduleRefresh = true): void {
+		this.requestedReviewBranch = branch;
+		this.reviewSnapshot = undefined;
+		this.refreshReviewSurfaces();
+		if (scheduleRefresh) window.setTimeout(() => void this.refreshReviews(), 0);
+	}
+
 	async refreshReviews(): Promise<void> {
+		let branch: string;
 		try {
-			await this.ensureReview();
+			branch = await this.currentBranch(this.getGit());
 		} catch (error) {
-			this.reviewSnapshot = undefined;
-			this.refreshReviewSurfaces();
-			for (const leaf of this.app.workspace.getLeavesOfType(REVIEW_CENTER_VIEW)) {
-				const view = leaf.view;
-				if (view instanceof ReviewCenterView) view.showError(redactSensitiveText(error));
+			this.showReviewError(error);
+			return;
+		}
+		this.requestedReviewBranch = branch;
+		return this.reviewRefresh.run(branch, async () => {
+			try {
+				const snapshot = await this.loadReview(branch);
+				if (this.requestedReviewBranch === branch) this.applyReviewSnapshot(snapshot);
+			} catch (error) {
+				if (this.requestedReviewBranch === branch) this.showReviewError(error);
 			}
+		});
+	}
+
+	private showReviewError(error: unknown): void {
+		this.reviewSnapshot = undefined;
+		this.refreshReviewSurfaces();
+		for (const leaf of this.app.workspace.getLeavesOfType(REVIEW_CENTER_VIEW)) {
+			const view = leaf.view;
+			if (view instanceof ReviewCenterView) view.showError(redactSensitiveText(error));
 		}
 	}
 
 	getReviewSnapshot(): ReviewSnapshot | undefined {
 		return this.reviewSnapshot;
+	}
+
+	private async getCurrentReviewSnapshot(): Promise<ReviewSnapshot> {
+		const branch = await this.currentBranch(this.getGit());
+		const snapshot = this.reviewSnapshot;
+		if (!snapshot || snapshot.pull.headRefName !== branch) {
+			throw new Error('The documentation branch changed. Refresh the Review panel and try again.');
+		}
+		return snapshot;
 	}
 
 	async commentOnSelection(editor?: Editor, markdownView?: MarkdownView): Promise<void> {
@@ -622,7 +873,8 @@ export default class GHSyncPlugin extends Plugin {
 			const from = activeEditor.posToOffset(activeEditor.getCursor('from'));
 			const to = activeEditor.posToOffset(activeEditor.getCursor('to'));
 			const anchor = createTextAnchor(activeEditor.getValue(), Math.min(from, to), Math.max(from, to), view.file.path);
-			const snapshot = await this.ensureReview();
+			await this.refreshReviews();
+			const snapshot = await this.getCurrentReviewSnapshot();
 			const collaborators = await this.getReviewClient().listCollaborators(snapshot.repository);
 			new ReviewCommentModal(this.app, anchor, collaborators, async (body) => {
 				await this.getReviewClient().createComment(snapshot.repository, snapshot.pull.number, anchor, body);
@@ -636,19 +888,21 @@ export default class GHSyncPlugin extends Plugin {
 	}
 
 	async replyToReview(comment: GitHubReviewComment): Promise<void> {
-		const snapshot = this.reviewSnapshot;
-		if (!snapshot) return;
-		const collaborators = await this.getReviewClient().listCollaborators(snapshot.repository);
-		new ReviewCommentModal(this.app, comment.metadata.anchor, collaborators, async (body) => {
-			await this.getReviewClient().createComment(snapshot.repository, snapshot.pull.number, comment.metadata.anchor, body, comment.id);
-			await this.refreshReviews();
-		}).open();
+		try {
+			const snapshot = await this.getCurrentReviewSnapshot();
+			const collaborators = await this.getReviewClient().listCollaborators(snapshot.repository);
+			new ReviewCommentModal(this.app, comment.metadata.anchor, collaborators, async (body) => {
+				await this.getReviewClient().createComment(snapshot.repository, snapshot.pull.number, comment.metadata.anchor, body, comment.id);
+				await this.refreshReviews();
+			}).open();
+		} catch (error) {
+			this.showNotice(error, 'ERROR', 12000);
+		}
 	}
 
 	async setReviewResolved(comment: GitHubReviewComment, resolved: boolean): Promise<void> {
-		const snapshot = this.reviewSnapshot;
-		if (!snapshot) return;
 		try {
+			const snapshot = await this.getCurrentReviewSnapshot();
 			await this.getReviewClient().setResolved(snapshot.repository, snapshot.pull.number, comment, resolved);
 			await this.refreshReviews();
 		} catch (error) {
@@ -870,12 +1124,36 @@ export default class GHSyncPlugin extends Plugin {
 				await git.checkoutLocalBranch(newBranch);
 			}
 
+			progress.step('Preparing the branch for discussion');
+			await this.ensureGitIdentity(git);
+			await createReviewReadyCommit(git, baseBranch, newBranch);
+			this.selectReviewBranch(newBranch, false);
 			progress.step(`Publishing ${newBranch} to GitHub`);
 			await git.push('origin', newBranch, ['-u']);
 			progress.step('Preparing documentation review');
 			const review = await this.ensureReviewAfterPush(newBranch);
 			await this.updateBranchStatus(git, describeBranchSync(0, 0, true));
 			return { status: 'success', message: `Started change: ${newBranch}${review ?? ''}` };
+		});
+	}
+
+	async prepareCurrentReview(): Promise<void> {
+		await this.withGitLock('Preparing documentation review', async (progress) => {
+			progress.step('Checking the current branch');
+			const git = this.getGit();
+			await this.configureRemote(git);
+			const branch = await this.currentBranch(git);
+			const baseBranch = this.getBaseBranch();
+			if (branch === baseBranch) throw new Error('Start or switch to a change branch before adding review comments.');
+			progress.step('Creating the review starting point');
+			await this.ensureGitIdentity(git);
+			await createReviewReadyCommit(git, baseBranch, branch);
+			progress.step(`Publishing ${branch} to GitHub`);
+			await git.push('origin', branch, ['-u']);
+			progress.step('Opening the documentation review');
+			const review = await this.ensureReview(branch);
+			await this.updateBranchStatus(git, describeBranchSync(0, 0, true));
+			return { status: 'success', message: `Review #${review.pull.number} is ready for comments` };
 		});
 	}
 
@@ -1053,6 +1331,7 @@ export default class GHSyncPlugin extends Plugin {
 		this.addCommand({ id: 'github-sync-branch-manager', name: 'Open branch manager', callback: () => this.openBranchManager() });
 		this.addCommand({ id: 'github-sync-conflict-center', name: 'Open conflict center', callback: () => void this.openConflictCenter() });
 		this.addCommand({ id: 'github-sync-review-center', name: 'Open review center', callback: () => void this.openReviewCenter() });
+		this.addCommand({ id: 'github-sync-setup', name: 'Open GitHub connection setup', callback: () => void this.openGitHubSetup() });
 		this.addCommand({
 			id: 'github-sync-comment-selection',
 			name: 'Comment on selected text',
@@ -1069,6 +1348,11 @@ export default class GHSyncPlugin extends Plugin {
 		});
 		this.addCommand({ id: 'github-sync-return-to-base', name: 'Return to base branch', callback: () => void this.returnToBaseBranch() });
 		this.addSettingTab(new GHSyncSettingTab(this.app, this));
+		this.app.workspace.onLayoutReady(() => {
+			if (!this.settings.setupAssistantSeen) {
+				window.setTimeout(() => void this.openGitHubSetup(), 500);
+			}
+		});
 
 		const interval = this.settings.syncinterval;
 		if (Number.isFinite(interval) && interval >= 1) {
@@ -1170,7 +1454,7 @@ class ReviewCenterView extends ItemView {
 	getIcon(): string { return 'messages-square'; }
 
 	async onOpen(): Promise<void> {
-		this.refresh();
+		activateReviewCenter(() => this.refresh(), () => this.plugin.refreshReviews());
 	}
 
 	showError(message: string): void {
@@ -1199,7 +1483,21 @@ class ReviewCenterView extends ItemView {
 			setIcon(icon, this.error ? 'circle-alert' : 'loader-circle');
 			empty.createDiv({ cls: 'gh-sync-review-center__empty-title', text: this.error ? 'Review setup needed' : 'Loading review…' });
 			empty.createEl('p', { text: this.error ?? 'Checking the draft pull request for this branch.' });
-			if (this.error) empty.createEl('p', { text: 'Install and sign in to GitHub CLI, then refresh. Your Git branch sync still works independently.' });
+			if (this.error) {
+				empty.createEl('p', { text: 'Your documents are safe. Use the guided setup below—no SSH key or terminal login is required.' });
+				const actions = empty.createDiv({ cls: 'gh-sync-review-center__empty-actions' });
+				if (/no commits between/i.test(this.error)) {
+					const prepare = actions.createEl('button', { cls: 'mod-cta', text: 'Prepare review', attr: { type: 'button' } });
+					prepare.addEventListener('click', () => void this.plugin.prepareCurrentReview());
+				}
+				const connect = actions.createEl('button', { text: 'GitHub setup', attr: { type: 'button' } });
+				connect.addEventListener('click', () => void this.plugin.openGitHubSetup());
+				const retry = actions.createEl('button', { text: 'Check again', attr: { type: 'button' } });
+				retry.addEventListener('click', () => {
+					this.error = undefined;
+					void this.plugin.refreshReviews();
+				});
+			}
 			return;
 		}
 
@@ -1532,7 +1830,18 @@ class BranchManagerModal extends Modal {
 					}));
 			}
 		} catch (error) {
-			loading.setText(`Could not load branches: ${redactSensitiveText(error)}`);
+			if (!isGitHubCredentialSetupError(error)) {
+				loading.setText(`Could not load branches: ${redactSensitiveText(error)}`);
+				return;
+			}
+			loading.remove();
+			new Setting(this.contentEl)
+				.setName('GitHub access needs setup')
+				.setDesc('Git cannot authenticate this computer. Open setup to reconnect the account or repair Git access.')
+				.addButton((button) => button.setButtonText('Open GitHub setup').setCta().onClick(() => {
+					this.close();
+					this.plugin.openGitHubSetup();
+				}));
 		}
 	}
 
@@ -1568,14 +1877,233 @@ class BranchNameModal extends Modal {
 	}
 }
 
+class GitHubSetupModal extends Modal {
+	private readiness?: GitHubSetupReadiness;
+	private busy: 'checking' | 'connecting' | 'finishing' | undefined;
+	private operationError?: string;
+	private authAbort?: AbortController;
+	private closed = false;
+
+	constructor(app: App, private readonly plugin: GHSyncPlugin) {
+		super(app);
+	}
+
+	onOpen(): void {
+		this.closed = false;
+		this.modalEl.addClass('gh-sync-setup-modal');
+		this.render();
+		void this.check();
+	}
+
+	private renderStep(
+		container: HTMLElement,
+		title: string,
+		detail: string,
+		state: 'ready' | 'action' | 'pending',
+	): void {
+		const step = container.createDiv({ cls: `gh-sync-setup-step is-${state}` });
+		const icon = step.createSpan({ cls: `gh-sync-setup-step__icon${state === 'pending' ? ' gh-sync-operation__spinner' : ''}` });
+		setIcon(icon, state === 'ready' ? 'circle-check' : state === 'action' ? 'circle-alert' : 'loader-circle');
+		const copy = step.createDiv({ cls: 'gh-sync-setup-step__copy' });
+		copy.createDiv({ cls: 'gh-sync-setup-step__title', text: title });
+		copy.createDiv({ cls: 'gh-sync-setup-step__detail', text: detail });
+	}
+
+	private render(): void {
+		this.contentEl.empty();
+		const hero = this.contentEl.createDiv({ cls: 'gh-sync-setup__hero' });
+		const heroIcon = hero.createSpan({ cls: 'gh-sync-setup__hero-icon' });
+		setIcon(heroIcon, 'github');
+		const heroCopy = hero.createDiv();
+		heroCopy.createEl('h2', { text: 'Connect documentation to GitHub' });
+		heroCopy.createEl('p', { text: 'Approve once in your browser. No SSH keys, access tokens, or terminal commands are needed here.' });
+
+		const steps = this.contentEl.createDiv({ cls: 'gh-sync-setup__steps', attr: { 'aria-live': 'polite' } });
+		if (!this.readiness || this.busy === 'checking') {
+			this.renderStep(steps, 'Required apps', 'Checking Git and the GitHub connection helper…', 'pending');
+			this.renderStep(steps, 'GitHub account', 'Checking your saved connection…', 'pending');
+			this.renderStep(steps, 'Private documentation', 'Checking repository access…', 'pending');
+		} else {
+			const helpersReady = this.readiness.gitReady && this.readiness.connection !== 'missing-helper';
+			this.renderStep(
+				steps,
+				'Required apps',
+				helpersReady ? 'Git and GitHub helper are ready.' : 'Run the NuLegal Docs installer to add the missing helper.',
+				helpersReady ? 'ready' : 'action',
+			);
+			const accountReady = Boolean(this.readiness.login);
+			this.renderStep(
+				steps,
+				'GitHub account',
+				accountReady ? `Connected as @${this.readiness.login}.` : this.readiness.connection === 'offline' ? 'Connection could not be checked while offline.' : 'Browser approval is required.',
+				accountReady ? 'ready' : 'action',
+			);
+			this.renderStep(
+				steps,
+				'Private documentation',
+				this.readiness.ready
+					? `${this.readiness.repository} is available.`
+					: !this.readiness.vaultReady ? this.readiness.vaultDetail : this.readiness.detail,
+				this.readiness.ready ? 'ready' : 'action',
+			);
+		}
+
+		if (this.busy === 'connecting' || this.busy === 'finishing') {
+			const waiting = this.contentEl.createDiv({ cls: 'gh-sync-setup__waiting', attr: { role: 'status', 'aria-live': 'polite' } });
+			const spinner = waiting.createSpan({ cls: 'gh-sync-operation__spinner' });
+			setIcon(spinner, 'loader-circle');
+			const waitingCopy = waiting.createDiv();
+			waitingCopy.createDiv({ cls: 'gh-sync-setup__waiting-title', text: this.busy === 'connecting' ? 'Waiting for GitHub in your browser' : 'Finishing passwordless setup' });
+			waitingCopy.createDiv({ text: this.busy === 'connecting'
+				? 'Approve the request there. If GitHub asks for a one-time code, paste it—the code is already copied.'
+				: 'Checking the vault, HTTPS remote, and Git author details.' });
+		}
+
+		const warningText = this.operationError ?? this.readiness?.warning;
+		if (warningText) {
+			const warning = this.contentEl.createDiv({ cls: 'gh-sync-setup__warning', attr: { role: 'alert' } });
+			setIcon(warning.createSpan(), 'triangle-alert');
+			warning.createDiv({ text: warningText });
+		}
+
+		const actions = this.contentEl.createDiv({ cls: 'gh-sync-setup__actions' });
+		if (this.busy) {
+			if (this.busy === 'connecting') {
+				const browser = actions.createEl('button', { cls: 'mod-cta', text: 'Open GitHub', attr: { type: 'button' } });
+				browser.addEventListener('click', () => window.open('https://github.com/login/device', '_blank', 'noopener,noreferrer'));
+			}
+			const close = actions.createEl('button', { text: this.busy === 'connecting' ? 'Cancel' : 'Close', attr: { type: 'button' } });
+			close.addEventListener('click', () => this.close());
+			return;
+		}
+
+		if (this.readiness?.ready) {
+			const check = actions.createEl('button', { text: 'Check again', attr: { type: 'button' } });
+			check.addEventListener('click', () => void this.check());
+			const done = actions.createEl('button', { cls: 'mod-cta', text: 'Done', attr: { type: 'button' } });
+			done.addEventListener('click', () => this.close());
+			return;
+		}
+
+		if (!this.readiness?.gitReady || this.readiness?.connection === 'missing-helper') {
+			const guide = actions.createEl('button', { cls: 'mod-cta', text: 'Open setup guide', attr: { type: 'button' } });
+			guide.addEventListener('click', () => {
+				this.close();
+				void this.app.workspace.openLinkText('README.md', '', false);
+			});
+		} else if (this.readiness?.connection === 'no-access') {
+			const access = actions.createEl('button', { text: 'Open repository access', attr: { type: 'button' } });
+			access.addEventListener('click', () => window.open(`https://github.com/${this.readiness?.repository ?? ''}`, '_blank', 'noopener,noreferrer'));
+			const reconnect = actions.createEl('button', { cls: 'mod-cta', text: 'Reconnect account', attr: { type: 'button' } });
+			reconnect.addEventListener('click', () => void this.connect());
+		} else if (this.readiness?.connection === 'connected' && this.readiness.vaultRepairable) {
+			const finish = actions.createEl('button', { cls: 'mod-cta', text: 'Finish setup', attr: { type: 'button' } });
+			finish.addEventListener('click', () => void this.finish());
+		} else if (this.readiness?.connection === 'connected') {
+			const guide = actions.createEl('button', { cls: 'mod-cta', text: 'Open setup guide', attr: { type: 'button' } });
+			guide.addEventListener('click', () => {
+				this.close();
+				void this.app.workspace.openLinkText('README.md', '', false);
+			});
+		} else if (this.readiness?.connection !== 'offline') {
+			const connect = actions.createEl('button', { cls: 'mod-cta', text: 'Connect GitHub', attr: { type: 'button' } });
+			connect.addEventListener('click', () => void this.connect());
+		}
+		const check = actions.createEl('button', { text: 'Check again', attr: { type: 'button' } });
+		check.addEventListener('click', () => void this.check());
+	}
+
+	private async check(): Promise<void> {
+		this.busy = 'checking';
+		this.operationError = undefined;
+		this.render();
+		this.readiness = await this.plugin.getGitHubSetupReadiness();
+		if (this.closed) return;
+		this.busy = undefined;
+		if (this.readiness.ready) void this.plugin.completeGitHubSetup();
+		this.render();
+	}
+
+	private async connect(): Promise<void> {
+		this.busy = 'connecting';
+		this.operationError = undefined;
+		this.authAbort = new AbortController();
+		this.render();
+		try {
+			this.readiness = await this.plugin.connectGitHubInBrowser(this.authAbort.signal);
+			if (this.closed) return;
+			if (this.readiness.ready) void this.plugin.completeGitHubSetup();
+		} catch (error) {
+			if (this.closed) return;
+			this.readiness = await this.plugin.getGitHubSetupReadiness();
+			if (this.closed) return;
+			const problem = classifyGitHubConnectionError(error);
+			this.operationError = problem.kind === 'unknown'
+				? `Setup could not finish: ${redactSensitiveText(error)}`
+				: problem.message;
+		}
+		this.authAbort = undefined;
+		this.busy = undefined;
+		this.render();
+	}
+
+	private async finish(): Promise<void> {
+		this.busy = 'finishing';
+		this.operationError = undefined;
+		this.render();
+		try {
+			this.readiness = await this.plugin.finishGitHubSetup();
+			if (this.closed) return;
+			if (this.readiness.ready) void this.plugin.completeGitHubSetup();
+		} catch (error) {
+			if (this.closed) return;
+			this.readiness = await this.plugin.getGitHubSetupReadiness();
+			if (this.closed) return;
+			this.operationError = `Setup could not finish: ${redactSensitiveText(error)}`;
+		}
+		this.busy = undefined;
+		this.render();
+	}
+
+	onClose(): void {
+		this.closed = true;
+		this.authAbort?.abort();
+		this.authAbort = undefined;
+		this.contentEl.empty();
+	}
+}
+
 class GHSyncSettingTab extends PluginSettingTab {
 	constructor(app: App, private readonly plugin: GHSyncPlugin) {
 		super(app, plugin);
 	}
 
+	private renderConnectionCard(container: HTMLElement): void {
+		const card = container.createDiv({ cls: 'gh-sync-setup-card' });
+		const icon = card.createSpan({ cls: 'gh-sync-setup-card__icon gh-sync-operation__spinner' });
+		setIcon(icon, 'loader-circle');
+		const copy = card.createDiv({ cls: 'gh-sync-setup-card__copy' });
+		copy.createDiv({ cls: 'gh-sync-setup-card__title', text: 'GitHub connection' });
+		const detail = copy.createDiv({ cls: 'gh-sync-setup-card__detail', text: 'Checking this computer…' });
+		const open = card.createEl('button', { text: 'Open setup', attr: { type: 'button' } });
+		open.addEventListener('click', () => void this.plugin.openGitHubSetup());
+		void this.plugin.getGitHubSetupReadiness().then((readiness) => {
+			if (!card.isConnected) return;
+			icon.removeClass('gh-sync-operation__spinner');
+			card.addClass(readiness.ready ? 'is-ready' : 'is-action');
+			setIcon(icon, readiness.ready ? 'circle-check' : 'circle-alert');
+			const accountReady = readiness.connection === 'connected';
+			detail.setText(readiness.warning ?? (!accountReady ? readiness.detail : !readiness.vaultReady ? readiness.vaultDetail : readiness.detail));
+			open.setText(readiness.ready
+				? 'Manage'
+				: accountReady ? 'Finish setup' : readiness.connection === 'no-access' ? 'Review access' : 'Connect GitHub');
+		});
+	}
+
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
+		this.renderConnectionCard(containerEl);
 
 		const howto = containerEl.createEl('div', { cls: 'howto' });
 		howto.createEl('div', { text: 'Branch-based documentation workflow', cls: 'howto_title' });
@@ -1583,7 +2111,7 @@ class GHSyncSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('Remote URL')
-			.setDesc('Use an HTTPS URL without embedded credentials, or an SSH URL.')
+			.setDesc('The installer configures a passwordless GitHub HTTPS address. Never put a password or token here.')
 			.addText((text) => text.setValue(this.plugin.settings.remoteURL).onChange(async (value) => {
 				this.plugin.settings.remoteURL = value;
 				await this.plugin.saveSettings();
@@ -1615,7 +2143,7 @@ class GHSyncSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('Git binary location')
-			.setDesc('Optional directory containing the Git executable. Leave empty when Git is on PATH.')
+			.setDesc('Advanced repair option. The NuLegal Docs installer configures Git automatically; most people should leave this empty.')
 			.addText((text) => text.setValue(this.plugin.settings.gitLocation).onChange(async (value) => {
 				this.plugin.settings.gitLocation = value;
 				await this.plugin.saveSettings();
@@ -1624,7 +2152,7 @@ class GHSyncSettingTab extends PluginSettingTab {
 		containerEl.createEl('h3', { text: 'Selected-text reviews' });
 		containerEl.createEl('p', {
 			cls: 'setting-item-description',
-			text: 'Comments are stored on the change branch’s draft GitHub pull request. GitHub accounts and the authenticated GitHub CLI provide identity, mentions, and notifications.',
+			text: 'Comments are stored on the change branch’s draft GitHub pull request. Use the guided GitHub connection above; no SSH key or access token is required.',
 		});
 
 		new Setting(containerEl)
@@ -1637,7 +2165,7 @@ class GHSyncSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('GitHub CLI executable')
-			.setDesc('Optional full path to gh. Leave empty when the GitHub CLI is on PATH.')
+			.setDesc('Advanced repair option. The NuLegal Docs installer finds this helper automatically; most people should leave this unchanged.')
 			.addText((text) => text
 				.setPlaceholder('/opt/homebrew/bin/gh')
 				.setValue(this.plugin.settings.githubCliPath)
