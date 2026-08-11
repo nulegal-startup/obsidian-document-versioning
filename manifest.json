@@ -1,7 +1,7 @@
 {
-	"id": "github-sync",
+	"id": "nulegal-document-versioning",
 	"name": "Document Versioning",
-	"version": "1.12.0",
+	"version": "1.13.0",
 	"minAppVersion": "0.15.0",
 	"description": "Version Obsidian documents through safe GitHub branches, reviews, and document history.",
 	"author": "NuLegal",

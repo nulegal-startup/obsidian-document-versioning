@@ -146,7 +146,7 @@ npm run build
 Copy `main.js`, `manifest.json`, and `styles.css` into:
 
 ```text
-<vault>/.obsidian/plugins/github-sync/
+<vault>/.obsidian/plugins/nulegal-document-versioning/
 ```
 
 Then reload Obsidian and enable **Document Versioning** under Community Plugins.
