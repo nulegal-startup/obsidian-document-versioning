@@ -125,3 +125,27 @@ test('rejects unsafe status paths before they can reach Git or the vault', () =>
 	assert.throws(() => changes.parseLocalChanges(' M ../outside.md\0'), /inside the vault/);
 	assert.throws(() => changes.parseLocalChanges('?? bad\nname.md\0'), /control characters/);
 });
+
+test('groups the visible list by folder and gives every state human copy', () => {
+	const parsed = changes.parseLocalChanges([
+		' M README.md',
+		' M docs/billing/Plan.md',
+		'?? docs/billing/Questions.md',
+		'D  docs/onboarding/Old.md',
+		'',
+	].join('\0'));
+	const groups = changes.groupLocalChangesByFolder(parsed);
+
+	assert.deepEqual(groups.map((group) => [group.folder, group.changes.map((change) => change.path)]), [
+		['Vault root', ['README.md']],
+		['docs/billing', ['docs/billing/Plan.md', 'docs/billing/Questions.md']],
+		['docs/onboarding', ['docs/onboarding/Old.md']],
+	]);
+	assert.deepEqual(changes.describeLocalChange(parsed[0]), {
+		label: 'Modified',
+		detail: 'Edited on this computer',
+		icon: 'file-pen-line',
+	});
+	assert.equal(changes.describeLocalChange(parsed[2]).label, 'New file');
+	assert.equal(changes.describeLocalChange(parsed[3]).label, 'Deleted');
+});
