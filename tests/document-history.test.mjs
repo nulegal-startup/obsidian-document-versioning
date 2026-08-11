@@ -108,6 +108,20 @@ test('creates a bounded added-file preview for an untracked document and support
 	assert.deepEqual(result.versions, []);
 });
 
+test('does not render bytes from a new binary file', async () => {
+	const responses = new Map([
+		['rev-parse --abbrev-ref HEAD', 'changes/new-media\n'],
+		['status --porcelain=v1 -z --untracked-files=all', '?? media/diagram.png\0'],
+		['rev-parse --verify HEAD', new Error('unknown revision')],
+	]);
+	const result = await new history.DocumentHistoryService(createGit(responses))
+		.load('media/diagram.png', '\u0089PNG\0binary bytes');
+
+	assert.equal(result.local.patch.binary, true);
+	assert.match(result.local.patch.text, /Binary document changed/);
+	assert.equal(result.local.patch.text.includes('binary bytes'), false);
+});
+
 test('classifies staged, mixed, conflicted, and renamed document states', () => {
 	assert.equal(history.classifyDocumentStatus('M  note.md\0'), 'staged');
 	assert.equal(history.classifyDocumentStatus('MM note.md\0'), 'staged-and-modified');

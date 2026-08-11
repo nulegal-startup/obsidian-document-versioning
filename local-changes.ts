@@ -17,6 +17,17 @@ export interface LocalChangesSnapshot {
 	changes: LocalChange[];
 }
 
+export interface LocalChangeGroup {
+	folder: string;
+	changes: LocalChange[];
+}
+
+export interface LocalChangeDescription {
+	label: string;
+	detail: string;
+	icon: string;
+}
+
 export interface LocalChangesGit {
 	raw(args: string[]): Promise<string>;
 }
@@ -37,6 +48,33 @@ function classifyChange(code: string): LocalChangeState {
 
 function sortChanges(values: LocalChange[]): LocalChange[] {
 	return values.sort((left, right) => left.path.localeCompare(right.path));
+}
+
+export function groupLocalChangesByFolder(changes: LocalChange[]): LocalChangeGroup[] {
+	const groups = new Map<string, LocalChange[]>();
+	for (const change of sortChanges([...changes])) {
+		const separator = change.path.lastIndexOf('/');
+		const folder = separator < 0 ? 'Vault root' : change.path.slice(0, separator);
+		const group = groups.get(folder) ?? [];
+		group.push(change);
+		groups.set(folder, group);
+	}
+	return Array.from(groups, ([folder, values]) => ({ folder, changes: values }))
+		.sort((left, right) => {
+			if (left.folder === 'Vault root') return -1;
+			if (right.folder === 'Vault root') return 1;
+			return left.folder.localeCompare(right.folder);
+		});
+}
+
+export function describeLocalChange(change: LocalChange): LocalChangeDescription {
+	switch (change.state) {
+		case 'added': return { label: 'New file', detail: 'Created on this computer', icon: 'file-plus-2' };
+		case 'deleted': return { label: 'Deleted', detail: 'Removed on this computer', icon: 'file-minus-2' };
+		case 'renamed': return { label: 'Renamed', detail: `Previously ${change.oldPath ?? 'another file'}`, icon: 'file-input' };
+		case 'conflicted': return { label: 'Conflict', detail: 'Needs attention before syncing', icon: 'triangle-alert' };
+		default: return { label: 'Modified', detail: 'Edited on this computer', icon: 'file-pen-line' };
+	}
 }
 
 export function parseLocalChanges(raw: string): LocalChange[] {

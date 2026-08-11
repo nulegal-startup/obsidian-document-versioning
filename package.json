@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-document-versioning",
-	"version": "1.11.0",
+	"version": "1.12.0",
 	"author": "NuLegal",
 	"description": "Version Obsidian documents through safe GitHub branches, reviews, and document history.",
 	"main": "main.js",

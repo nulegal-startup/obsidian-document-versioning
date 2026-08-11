@@ -39,6 +39,14 @@ import {
 	DocumentPatch,
 	DocumentVersion,
 } from './document-history';
+import {
+	applyLocalRevert,
+	describeLocalChange,
+	groupLocalChangesByFolder,
+	LocalChange,
+	LocalChangesService,
+	LocalChangesSnapshot,
+} from './local-changes';
 
 type NoticeLevelSetting = 'ALL' | 'WARNING' | 'ERROR';
 type LegacyNoticeLevelSetting = NoticeLevelSetting | 'WARNINGS';
@@ -87,6 +95,7 @@ const DEFAULT_SETTINGS: GHSyncSettings = {
 const CONFLICT_CENTER_VIEW = 'github-sync-conflict-center';
 const REVIEW_CENTER_VIEW = 'github-sync-review-center';
 const DOCUMENT_HISTORY_VIEW = 'github-sync-document-history';
+const LOCAL_CHANGES_VIEW = 'github-sync-local-changes';
 
 interface ReviewSnapshot {
 	repository: GitHubRepository;
@@ -100,6 +109,7 @@ interface BranchSnapshot {
 	branches: string[];
 	sync: BranchSyncSummary;
 	isClean: boolean;
+	localChangeCount: number;
 }
 
 interface GitHubSetupReadiness {
@@ -232,6 +242,7 @@ export default class GHSyncPlugin extends Plugin {
 	private displayedBranch?: string;
 	private displayedSync?: BranchSyncSummary;
 	private displayedDirty = false;
+	private displayedDirtyCount = 0;
 	private conflictedFiles = new Map<string, number>();
 	private dirtyRefreshTimer?: number;
 	private readonly gitControlEls: HTMLElement[] = [];
@@ -367,6 +378,88 @@ export default class GHSyncPlugin extends Plugin {
 	async loadDocumentVersionPatch(version: DocumentVersion): Promise<DocumentPatch> {
 		if (this.syncInProgress) throw new Error('Git is updating. Try the version again when the operation finishes.');
 		return new DocumentHistoryService(this.getHistoryGit()).loadVersionPatch(version.hash, version.path, version.previousPath);
+	}
+
+	private async saveOpenDocuments(): Promise<void> {
+		const saves: Promise<void>[] = [];
+		for (const leaf of this.app.workspace.getLeavesOfType('markdown')) {
+			if (leaf.view instanceof MarkdownView) saves.push(leaf.view.save());
+		}
+		await Promise.all(saves);
+	}
+
+	async loadLocalChanges(): Promise<LocalChangesSnapshot> {
+		if (this.syncInProgress) throw new Error('Git is updating. Local changes will refresh when the operation finishes.');
+		await this.saveOpenDocuments();
+		return new LocalChangesService(this.getHistoryGit()).load(this.settings.documentRenameHints);
+	}
+
+	async loadLocalChangePatch(change: LocalChange): Promise<DocumentPatch> {
+		if (this.syncInProgress) throw new Error('Git is updating. Try this file again when the operation finishes.');
+		const view = this.markdownViewForPath(change.path);
+		let contents = '';
+		if (view?.file) {
+			await view.save();
+			contents = view.getViewData();
+		} else if (change.state !== 'deleted') {
+			contents = await this.app.vault.adapter.read(change.path).catch(() => '');
+		}
+		const hints = change.oldPath ? [change.oldPath] : this.documentRenameHistory(change.path);
+		const snapshot = await new DocumentHistoryService(this.getHistoryGit()).load(change.path, contents, hints);
+		return snapshot.local.patch;
+	}
+
+	async openLocalChangeFile(change: LocalChange): Promise<void> {
+		if (change.state === 'deleted') {
+			this.showNotice('This file was deleted locally. Revert it first if you want to open it.', 'WARNING');
+			return;
+		}
+		await this.app.workspace.openLinkText(change.path, '', true);
+	}
+
+	async revertLocalChange(change: LocalChange): Promise<void> {
+		await this.withGitLock('Reverting local file', async (progress) => {
+			progress.step('Saving open documents');
+			await this.saveOpenDocuments();
+			progress.step(`Reverting ${change.path}`);
+			await applyLocalRevert(change, this.getHistoryGit(), async (filePath) => {
+				const file = this.app.vault.getAbstractFileByPath(filePath);
+				if (!(file instanceof TFile)) throw new Error(`Could not move ${filePath} to Obsidian trash.`);
+				await this.app.vault.trash(file, true);
+			});
+			for (const filePath of [change.oldPath, change.path].filter((value): value is string => Boolean(value))) {
+				const view = this.markdownViewForPath(filePath);
+				if (view?.file && await this.app.vault.adapter.exists(filePath)) {
+					view.setViewData(await this.app.vault.adapter.read(filePath), false);
+				}
+			}
+			await this.updateBranchStatus();
+			return { status: 'success', message: `Reverted local changes in ${change.path}` };
+		});
+	}
+
+	async openLocalChanges(): Promise<void> {
+		let leaf = this.app.workspace.getLeavesOfType(LOCAL_CHANGES_VIEW)[0];
+		let created = false;
+		if (!leaf) {
+			leaf = this.app.workspace.getRightLeaf(false) ?? this.app.workspace.getLeaf(true);
+			await leaf.setViewState({ type: LOCAL_CHANGES_VIEW, active: true });
+			created = true;
+		}
+		await this.app.workspace.revealLeaf(leaf);
+		const view = leaf.view;
+		if (!created && view instanceof LocalChangesView) void view.refresh();
+	}
+
+	private refreshLocalChangesSurfaces(): void {
+		for (const leaf of this.app.workspace.getLeavesOfType(LOCAL_CHANGES_VIEW)) {
+			const view = leaf.view;
+			if (view instanceof LocalChangesView) void view.refresh();
+		}
+	}
+
+	private revealLocalChangesAfterBlock(): void {
+		window.setTimeout(() => void this.openLocalChanges(), 0);
 	}
 
 	async openDocumentHistory(filePath?: string): Promise<void> {
@@ -700,7 +793,7 @@ export default class GHSyncPlugin extends Plugin {
 			.filter((branch) => branch !== 'HEAD' && isSafeBranchRef(branch))))
 			.sort((left, right) => left.localeCompare(right));
 		await this.updateBranchStatus(git, sync);
-		return { current, base: this.getBaseBranch(), branches, sync, isClean: status.isClean() };
+		return { current, base: this.getBaseBranch(), branches, sync, isClean: status.isClean(), localChangeCount: status.files.length };
 	}
 
 	openBranchManager(): void {
@@ -715,6 +808,7 @@ export default class GHSyncPlugin extends Plugin {
 			const branchChanged = Boolean(this.displayedBranch && branch !== this.displayedBranch);
 			const status = await gitInstance.status();
 			this.displayedDirty = !status.isClean();
+			this.displayedDirtyCount = status.files.length;
 			await this.setConflictFiles(status.conflicted);
 			if (branch !== this.displayedBranch && !sync) this.displayedSync = undefined;
 			this.displayedBranch = branch;
@@ -730,12 +824,12 @@ export default class GHSyncPlugin extends Plugin {
 					text: this.displayedSync.compact,
 				});
 			}
-			if (this.displayedDirty) this.branchStatusEl.createSpan({ cls: 'gh-sync-status__dirty', text: '●' });
+			if (this.displayedDirty) this.branchStatusEl.createSpan({ cls: 'gh-sync-status__dirty', text: `${this.displayedDirtyCount} local` });
 			if (this.conflictedFiles.size > 0) {
 				this.branchStatusEl.createSpan({ cls: 'gh-sync-status__conflicts', text: `${this.conflictedFiles.size} conflict${this.conflictedFiles.size === 1 ? '' : 's'}` });
 			}
 			const stateDescription = this.displayedSync ? ` ${this.displayedSync.label}.` : '';
-			const dirtyDescription = this.displayedDirty ? ' Local edits.' : '';
+			const dirtyDescription = this.displayedDirty ? ` Local edits in ${this.displayedDirtyCount} file(s).` : '';
 			const conflictDescription = this.conflictedFiles.size > 0 ? ` ${this.conflictedFiles.size} conflicted document(s).` : '';
 			this.branchStatusEl.setAttr('title', `Current documentation branch: ${branch}.${stateDescription}${dirtyDescription}${conflictDescription}`);
 			this.branchStatusEl.setAttr('aria-busy', 'false');
@@ -761,6 +855,7 @@ export default class GHSyncPlugin extends Plugin {
 			this.registerDomEvent(badge, 'click', () => {
 				if (!this.syncInProgress) {
 					if (this.conflictedFiles.size > 0) void this.openConflictCenter();
+					else if (this.displayedDirty) void this.openLocalChanges();
 					else this.openBranchManager();
 				}
 			});
@@ -789,7 +884,7 @@ export default class GHSyncPlugin extends Plugin {
 				text: this.displayedSync.compact,
 			});
 		}
-		if (this.displayedDirty) this.headerBranchBadgeEl.createSpan({ cls: 'gh-sync-header-branch__dirty', text: '●' });
+		if (this.displayedDirty) this.headerBranchBadgeEl.createSpan({ cls: 'gh-sync-header-branch__dirty', text: `${this.displayedDirtyCount} local` });
 		if (this.conflictedFiles.size > 0) {
 			const conflicts = this.headerBranchBadgeEl.createSpan({ cls: 'gh-sync-header-branch__conflicts' });
 			const conflictIcon = conflicts.createSpan();
@@ -804,10 +899,15 @@ export default class GHSyncPlugin extends Plugin {
 			reviews.createSpan({ text: String(unresolvedReviews) });
 		}
 		const stateDescription = this.displayedSync ? ` ${this.displayedSync.label}.` : '';
-		const dirtyDescription = this.displayedDirty ? ' Local edits.' : '';
+		const dirtyDescription = this.displayedDirty ? ` Local edits in ${this.displayedDirtyCount} file(s).` : '';
 		const conflictDescription = this.conflictedFiles.size > 0 ? ` ${this.conflictedFiles.size} conflicted document(s).` : '';
-		this.headerBranchBadgeEl.setAttr('title', `Current documentation branch: ${this.displayedBranch}.${stateDescription}${dirtyDescription}${conflictDescription} Click to manage branches.`);
-		this.headerBranchBadgeEl.setAttr('aria-label', `Current documentation branch: ${this.displayedBranch}.${stateDescription}${dirtyDescription}${conflictDescription} Open branch manager.`);
+		const clickDescription = this.conflictedFiles.size > 0
+			? 'Open conflict center.'
+			: this.displayedDirty
+				? 'Open local changes.'
+				: 'Open branch manager.';
+		this.headerBranchBadgeEl.setAttr('title', `Current documentation branch: ${this.displayedBranch}.${stateDescription}${dirtyDescription}${conflictDescription} ${clickDescription}`);
+		this.headerBranchBadgeEl.setAttr('aria-label', `Current documentation branch: ${this.displayedBranch}.${stateDescription}${dirtyDescription}${conflictDescription} ${clickDescription}`);
 		const actions = header.querySelector('.view-actions');
 		if (actions) {
 			header.insertBefore(this.headerBranchBadgeEl, actions);
@@ -870,6 +970,7 @@ export default class GHSyncPlugin extends Plugin {
 		} finally {
 			this.syncInProgress = false;
 			this.refreshDocumentHistorySurfaces();
+			this.refreshLocalChangesSurfaces();
 		}
 	}
 
@@ -1252,7 +1353,8 @@ export default class GHSyncPlugin extends Plugin {
 
 			if (!status.isClean()) {
 				if (currentBranch !== baseBranch) {
-					throw new Error(`Sync the edits on ${currentBranch} before starting another change.`);
+					this.revealLocalChangesAfterBlock();
+					throw new Error(`Review the local files, then sync or revert the edits on ${currentBranch} before starting another change.`);
 				}
 				if (status.conflicted.length > 0) {
 					throw new Error('Resolve the existing merge conflicts before starting a change.');
@@ -1320,7 +1422,8 @@ export default class GHSyncPlugin extends Plugin {
 			progress.step('Checking for unsaved Git changes');
 			const git = this.getGit();
 			if (!(await git.status()).isClean()) {
-				throw new Error('Sync or commit your current changes before returning to the base branch.');
+				this.revealLocalChangesAfterBlock();
+				throw new Error('Review the local files, then sync or revert them before returning to the base branch.');
 			}
 
 			progress.step('Fetching branches from GitHub');
@@ -1347,7 +1450,8 @@ export default class GHSyncPlugin extends Plugin {
 			if (!isSafeBranchRef(targetBranch)) throw new Error('The selected branch name is invalid.');
 			const git = this.getGit();
 			if (!(await git.status()).isClean()) {
-				throw new Error('Sync or discard your current edits before switching branches.');
+				this.revealLocalChangesAfterBlock();
+				throw new Error('Review the local files, then sync or revert them before switching branches.');
 			}
 
 			progress.step('Fetching branches from GitHub');
@@ -1426,6 +1530,7 @@ export default class GHSyncPlugin extends Plugin {
 		this.registerView(CONFLICT_CENTER_VIEW, (leaf) => new ConflictCenterView(leaf, this));
 		this.registerView(REVIEW_CENTER_VIEW, (leaf) => new ReviewCenterView(leaf, this));
 		this.registerView(DOCUMENT_HISTORY_VIEW, (leaf) => new DocumentHistoryView(leaf, this));
+		this.registerView(LOCAL_CHANGES_VIEW, (leaf) => new LocalChangesView(leaf, this));
 		this.registerEditorExtension(conflictEditorExtension({
 			isConflictedFile: (filePath) => this.isConflictedFile(filePath),
 			onDocumentUpdated: (filePath, remaining) => this.onConflictDocumentUpdated(filePath, remaining),
@@ -1452,6 +1557,7 @@ export default class GHSyncPlugin extends Plugin {
 		this.registerDomEvent(this.branchStatusEl, 'click', () => {
 			if (!this.syncInProgress) {
 				if (this.conflictedFiles.size > 0) void this.openConflictCenter();
+				else if (this.displayedDirty) void this.openLocalChanges();
 				else this.openBranchManager();
 			}
 		});
@@ -1484,11 +1590,19 @@ export default class GHSyncPlugin extends Plugin {
 				if (!this.syncInProgress) {
 					void this.updateBranchStatus();
 					this.refreshDocumentHistorySurfaces(file.path);
+					this.refreshLocalChangesSurfaces();
 				}
 			}, 350);
 		}));
+		this.registerEvent(this.app.vault.on('create', () => {
+			if (!this.syncInProgress) this.refreshLocalChangesSurfaces();
+		}));
+		this.registerEvent(this.app.vault.on('delete', () => {
+			if (!this.syncInProgress) this.refreshLocalChangesSurfaces();
+		}));
 		this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
 			if (file instanceof TFile && file.extension === 'md') void this.rememberDocumentRename(file.path, oldPath);
+			if (!this.syncInProgress) this.refreshLocalChangesSurfaces();
 		}));
 
 		const ribbonIconEl = this.addRibbonIcon('github', 'Sync current branch', () => void this.syncNotes());
@@ -1497,15 +1611,20 @@ export default class GHSyncPlugin extends Plugin {
 			if (!this.syncInProgress) this.openBranchManager();
 		});
 		branchRibbonEl.addClass('gh-sync-branch-ribbon');
+		const changesRibbonEl = this.addRibbonIcon('files', 'Open local changes', () => {
+			if (!this.syncInProgress) void this.openLocalChanges();
+		});
+		changesRibbonEl.addClass('gh-sync-changes-ribbon');
 		const reviewRibbonEl = this.addRibbonIcon('messages-square', 'Open documentation review', () => {
 			if (!this.syncInProgress) void this.openReviewCenter();
 		});
 		reviewRibbonEl.addClass('gh-sync-review-ribbon');
-		this.gitControlEls.push(ribbonIconEl, branchRibbonEl);
+		this.gitControlEls.push(ribbonIconEl, branchRibbonEl, changesRibbonEl);
 
 		this.addCommand({ id: 'github-sync-command', name: 'Sync current branch', callback: () => void this.syncNotes() });
 		this.addCommand({ id: 'github-sync-update-current', name: 'Update current branch from GitHub', callback: () => void this.updateCurrentBranch() });
 		this.addCommand({ id: 'github-sync-branch-manager', name: 'Open branch manager', callback: () => this.openBranchManager() });
+		this.addCommand({ id: 'github-sync-local-changes', name: 'Open local changes', callback: () => void this.openLocalChanges() });
 		this.addCommand({ id: 'github-sync-conflict-center', name: 'Open conflict center', callback: () => void this.openConflictCenter() });
 		this.addCommand({ id: 'github-sync-review-center', name: 'Open review center', callback: () => void this.openReviewCenter() });
 		this.addCommand({
@@ -1561,6 +1680,247 @@ export default class GHSyncPlugin extends Plugin {
 
 	async saveSettings(): Promise<void> {
 		await this.saveData(this.settings);
+	}
+}
+
+function renderDocumentPatch(container: HTMLElement, patch: DocumentPatch, label: string): void {
+	if (!patch.text.trim()) {
+		container.createDiv({ cls: 'gh-sync-document-history__no-patch', text: 'No text changes to preview for this file.' });
+		return;
+	}
+	const patchEl = container.createEl('pre', {
+		cls: 'gh-sync-document-patch',
+		attr: { tabindex: '0', role: 'region', 'aria-label': label },
+	});
+	for (const line of patch.text.split('\n')) {
+		let cls = 'gh-sync-document-patch__line';
+		if (line.startsWith('+') && !line.startsWith('+++')) cls += ' is-addition';
+		else if (line.startsWith('-') && !line.startsWith('---')) cls += ' is-deletion';
+		else if (line.startsWith('@@')) cls += ' is-hunk';
+		else if (/^(?:diff --git|index |--- |\+\+\+ |…)/.test(line)) cls += ' is-meta';
+		patchEl.createSpan({ cls, text: line || ' ' });
+	}
+}
+
+class LocalChangesView extends ItemView {
+	private snapshot?: LocalChangesSnapshot;
+	private error?: string;
+	private loading = false;
+	private requestId = 0;
+	private expandedKey?: string;
+	private loadingPatch?: string;
+	private readonly patches = new Map<string, DocumentPatch>();
+	private readonly patchErrors = new Map<string, string>();
+
+	constructor(leaf: WorkspaceLeaf, private readonly plugin: GHSyncPlugin) {
+		super(leaf);
+	}
+
+	getViewType(): string { return LOCAL_CHANGES_VIEW; }
+	getDisplayText(): string { return 'Local changes'; }
+	getIcon(): string { return 'files'; }
+
+	async onOpen(): Promise<void> {
+		await this.refresh();
+	}
+
+	private changeKey(change: LocalChange): string {
+		return `${change.oldPath ?? ''}\0${change.path}\0${change.code}`;
+	}
+
+	async refresh(): Promise<void> {
+		const requestId = ++this.requestId;
+		this.loading = true;
+		this.error = undefined;
+		this.render();
+		try {
+			const snapshot = await this.plugin.loadLocalChanges();
+			if (requestId !== this.requestId) return;
+			this.snapshot = snapshot;
+			const visibleKeys = new Set(snapshot.changes.map((change) => this.changeKey(change)));
+			if (this.expandedKey && !visibleKeys.has(this.expandedKey)) this.expandedKey = undefined;
+			for (const key of Array.from(this.patches.keys())) if (!visibleKeys.has(key)) this.patches.delete(key);
+			for (const key of Array.from(this.patchErrors.keys())) if (!visibleKeys.has(key)) this.patchErrors.delete(key);
+		} catch (error) {
+			if (requestId === this.requestId) this.error = redactSensitiveText(error);
+		} finally {
+			if (requestId === this.requestId) {
+				this.loading = false;
+				this.render();
+			}
+		}
+	}
+
+	private async togglePatch(change: LocalChange): Promise<void> {
+		const key = this.changeKey(change);
+		if (this.expandedKey === key) {
+			this.expandedKey = undefined;
+			this.render();
+			return;
+		}
+		this.expandedKey = key;
+		this.render();
+		if (this.patches.has(key) || this.patchErrors.has(key)) return;
+		this.loadingPatch = key;
+		this.render();
+		try {
+			this.patches.set(key, await this.plugin.loadLocalChangePatch(change));
+		} catch (error) {
+			this.patchErrors.set(key, redactSensitiveText(error));
+		} finally {
+			if (this.loadingPatch === key) this.loadingPatch = undefined;
+			if (this.expandedKey === key) this.render();
+		}
+	}
+
+	private confirmRevert(change: LocalChange): void {
+		new LocalChangeRevertModal(this.app, change, async () => {
+			await this.plugin.revertLocalChange(change);
+			await this.refresh();
+		}).open();
+	}
+
+	private render(): void {
+		this.contentEl.empty();
+		this.contentEl.addClass('gh-sync-local-changes');
+		this.contentEl.setAttr('aria-busy', String(this.loading));
+		const header = this.contentEl.createDiv({ cls: 'gh-sync-local-changes__header' });
+		const heading = header.createDiv();
+		heading.createEl('h3', { text: 'Local changes' });
+		heading.createEl('p', { text: 'Everything changed on this computer before the next sync.' });
+		const refresh = header.createEl('button', {
+			cls: 'clickable-icon',
+			attr: { type: 'button', 'aria-label': 'Refresh local changes' },
+		});
+		setIcon(refresh, 'refresh-cw');
+		refresh.disabled = this.loading;
+		refresh.addEventListener('click', () => void this.refresh());
+
+		if (this.loading && !this.snapshot) {
+			const loading = this.contentEl.createDiv({ cls: 'gh-sync-local-changes__empty' });
+			setIcon(loading.createSpan({ cls: 'gh-sync-document-history__spinner' }), 'loader-circle');
+			loading.createDiv({ cls: 'gh-sync-local-changes__empty-title', text: 'Checking this vault…' });
+			return;
+		}
+		if (this.error && !this.snapshot) {
+			const error = this.contentEl.createDiv({ cls: 'gh-sync-local-changes__empty is-error' });
+			setIcon(error.createSpan(), 'circle-alert');
+			error.createDiv({ cls: 'gh-sync-local-changes__empty-title', text: 'Could not read local changes' });
+			error.createEl('p', { text: this.error });
+			return;
+		}
+		const snapshot = this.snapshot;
+		if (!snapshot) return;
+
+		const summary = this.contentEl.createDiv({ cls: 'gh-sync-local-changes__summary' });
+		const branch = summary.createSpan();
+		setIcon(branch.createSpan(), 'git-branch');
+		branch.createSpan({ text: snapshot.branch });
+		summary.createSpan({
+			cls: 'gh-sync-local-changes__count',
+			text: `${snapshot.changes.length} file${snapshot.changes.length === 1 ? '' : 's'}`,
+		});
+		if (this.error) {
+			const warning = this.contentEl.createDiv({ cls: 'gh-sync-document-history__warning', attr: { role: 'status' } });
+			setIcon(warning.createSpan(), 'circle-alert');
+			warning.createSpan({ text: `Showing the last loaded changes. Refresh failed: ${this.error}` });
+		}
+		if (snapshot.changes.length === 0) {
+			const empty = this.contentEl.createDiv({ cls: 'gh-sync-local-changes__empty is-clean' });
+			setIcon(empty.createSpan(), 'circle-check');
+			empty.createDiv({ cls: 'gh-sync-local-changes__empty-title', text: 'No local changes' });
+			empty.createEl('p', { text: 'Every file matches the latest saved version on this branch.' });
+			return;
+		}
+
+		for (const group of groupLocalChangesByFolder(snapshot.changes)) {
+			const section = this.contentEl.createDiv({ cls: 'gh-sync-local-changes__group' });
+			const groupHeader = section.createDiv({ cls: 'gh-sync-local-changes__group-header' });
+			groupHeader.createSpan({ text: group.folder });
+			groupHeader.createSpan({ text: String(group.changes.length) });
+			const list = section.createDiv({ cls: 'gh-sync-local-changes__list' });
+			for (const change of group.changes) {
+				const key = this.changeKey(change);
+				const description = describeLocalChange(change);
+				const item = list.createDiv({ cls: `gh-sync-local-change is-${change.state}${this.expandedKey === key ? ' is-expanded' : ''}` });
+				const row = item.createDiv({ cls: 'gh-sync-local-change__row' });
+				const disclosure = row.createEl('button', {
+					cls: 'gh-sync-local-change__disclosure',
+					attr: { type: 'button', 'aria-expanded': String(this.expandedKey === key) },
+				});
+				const stateIcon = disclosure.createSpan({ cls: 'gh-sync-local-change__icon' });
+				setIcon(stateIcon, description.icon);
+				const copy = disclosure.createDiv({ cls: 'gh-sync-local-change__copy' });
+				copy.createDiv({ cls: 'gh-sync-local-change__name', text: change.path.split('/').pop() || change.path });
+				copy.createDiv({ cls: 'gh-sync-local-change__detail', text: description.detail });
+				disclosure.createSpan({ cls: `gh-sync-local-change__state is-${change.state}`, text: description.label });
+				const chevron = disclosure.createSpan({ cls: 'gh-sync-local-change__chevron' });
+				setIcon(chevron, this.expandedKey === key ? 'chevron-down' : 'chevron-right');
+				disclosure.addEventListener('click', () => void this.togglePatch(change));
+
+				const actions = row.createDiv({ cls: 'gh-sync-local-change__actions' });
+				if (change.state !== 'deleted') {
+					const open = actions.createEl('button', {
+						cls: 'clickable-icon',
+						attr: { type: 'button', 'aria-label': `Open ${change.path}`, title: 'Open file' },
+					});
+					setIcon(open, 'file-text');
+					open.addEventListener('click', () => void this.plugin.openLocalChangeFile(change));
+				}
+				const revert = actions.createEl('button', {
+					cls: 'clickable-icon gh-sync-local-change__revert',
+					attr: { type: 'button', 'aria-label': `Revert local changes in ${change.path}`, title: 'Revert this file' },
+				});
+				setIcon(revert, 'undo-2');
+				revert.addEventListener('click', () => this.confirmRevert(change));
+
+				if (this.expandedKey === key) {
+					const detail = item.createDiv({ cls: 'gh-sync-local-change__patch' });
+					if (this.loadingPatch === key) {
+						const loading = detail.createDiv({ cls: 'gh-sync-document-version__loading' });
+						setIcon(loading.createSpan({ cls: 'gh-sync-document-history__spinner' }), 'loader-circle');
+						loading.createSpan({ text: 'Loading file diff…' });
+					} else if (this.patchErrors.has(key)) {
+						detail.createDiv({ cls: 'gh-sync-document-version__error', text: this.patchErrors.get(key) });
+					} else {
+						const patch = this.patches.get(key);
+						if (patch) renderDocumentPatch(detail, patch, `Local changes in ${change.path}`);
+					}
+				}
+			}
+		}
+	}
+}
+
+class LocalChangeRevertModal extends Modal {
+	constructor(
+		app: App,
+		private readonly change: LocalChange,
+		private readonly onConfirm: () => Promise<void>,
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		this.contentEl.addClass('gh-sync-local-revert');
+		this.contentEl.createEl('h2', { text: 'Revert this file?' });
+		this.contentEl.createEl('p', { text: this.change.path });
+		this.contentEl.createEl('p', {
+			cls: 'gh-sync-local-revert__warning',
+			text: this.change.state === 'added'
+				? 'The new file will be moved to the macOS Trash.'
+				: 'All local edits in this file will be replaced by its latest saved Git version.',
+		});
+		const actions = new Setting(this.contentEl);
+		actions.addButton((button) => button.setButtonText('Keep changes').onClick(() => this.close()));
+		actions.addButton((button) => button.setButtonText('Revert file').setWarning().onClick(() => {
+			this.close();
+			void this.onConfirm();
+		}));
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
 	}
 }
 
@@ -2214,7 +2574,14 @@ class BranchManagerModal extends Modal {
 				text: snapshot.sync.label,
 			});
 			if (!snapshot.isClean) {
-				currentSetting.nameEl.createSpan({ cls: 'gh-sync-state-pill is-dirty', text: 'Local edits' });
+				currentSetting.nameEl.createSpan({
+					cls: 'gh-sync-state-pill is-dirty',
+					text: `${snapshot.localChangeCount} local file${snapshot.localChangeCount === 1 ? '' : 's'}`,
+				});
+				currentSetting.addButton((button) => button.setButtonText('Review changes').onClick(() => {
+					this.close();
+					void this.plugin.openLocalChanges();
+				}));
 			}
 
 			if (snapshot.current === snapshot.base && !snapshot.isClean) {

@@ -244,6 +244,7 @@ function countContentLines(contents: string): number {
 }
 
 function addedFileDocumentPatch(path: string, contents: string, maxLines: number, maxBytes: number): DocumentPatch {
+	if (contents.includes('\0')) return binaryPatch();
 	const additions = countContentLines(contents);
 	const exceedsBytes = contents.length > maxBytes
 		|| new TextEncoder().encode(contents).length > maxBytes;

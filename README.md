@@ -17,6 +17,8 @@ NuLegal Document Versioning gives non-technical teams a branch-based workflow fo
 - Keep errors and action-needed states visible long enough to understand what happened.
 - Follow Obsidian's live light/dark appearance when its base color scheme adapts to the system.
 - Show the current branch as a clickable badge in the active note header and status bar.
+- Show the number of changed local files directly on the branch badge.
+- Open one workspace-wide **Local changes** panel grouped by folder, with expandable diffs and per-file Open and Revert actions.
 - Open a read-only **Document history** panel from the clock button beside the branch badge.
 - Show current local edits before the document's committed versions, including commits that have not been pushed yet.
 - Display deterministic `ahead`, `behind`, `diverged`, `up to date`, and `not published` branch states.
@@ -54,7 +56,11 @@ The branch badge uses `↓N` for remote commits not yet pulled, `↑N` for local
 
 The default accepted branch is `main`, and the default change prefix is `changes`.
 
-## Document history
+## Local changes and document history
+
+Click the orange local-file count on the branch badge, use the files ribbon icon, or run **Open local changes**. The panel lists every modified, added, deleted, renamed, or conflicted file, grouped by folder. Expand a file to see its diff, open it directly, or use **Revert file** after confirmation. New files move to the macOS Trash; tracked files return to their latest committed version.
+
+If local files block a branch switch, the plugin opens this panel automatically so the user can see exactly what needs to be synced or reverted.
 
 Open any Markdown document and click the clock button beside its branch badge, use **View document history** in the editor menu, or run **Open history for current document** from the command palette.
 
@@ -66,11 +72,11 @@ The panel saves the current Obsidian editor buffer locally, then shows:
 - each version's author, time, summary, and a **Not pushed yet** label for local-only commits; and
 - a bounded, expandable line-by-line preview with additions and deletions for each saved version.
 
-Document history is read-only and uses only the vault's local Git data. Opening or refreshing it never fetches, pushes, contacts GitHub, or requires GitHub authentication. Large and binary changes receive a safe summary instead of rendering unbounded content. Restoring an old version is intentionally not included because that action can overwrite work or create conflicts.
+Both views use only the vault's local Git data. Opening or refreshing them never fetches, pushes, contacts GitHub, or requires GitHub authentication. Large and binary changes receive a safe summary instead of rendering unbounded content. Saved historical versions remain read-only; only current local file changes can be reverted.
 
 ## Setup
 
-For the managed NuLegal vault, follow the private [`nulegal-startup/docs` setup guide](https://github.com/nulegal-startup/docs#fast-setup-with-any-local-ai-agent). A local AI agent runs the reviewed Homebrew and Make commands to install Obsidian, Git, GitHub CLI, and `jq`; connect GitHub through the browser; clone both private repositories; install the latest private release; and open the vault. Users do not create SSH keys or paste tokens.
+For the managed NuLegal vault, follow the private [`nulegal-startup/docs` setup guide](https://github.com/nulegal-startup/docs#install-on-macos). It installs Obsidian, Git, GitHub CLI, the private extension, and the documentation vault. Users log in through the browser without creating SSH keys or pasting tokens.
 
 After the docs repository is cloned, the complete interface is:
 

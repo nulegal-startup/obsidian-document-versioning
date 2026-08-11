@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { build } from 'esbuild';
-import { mkdir } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { mkdir, mkdtemp, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { promisify } from 'node:util';
 
 await mkdir('.test-build', { recursive: true });
 await build({
@@ -13,6 +17,7 @@ await build({
 	outfile: '.test-build/local-changes.mjs',
 });
 const changes = await import(`${pathToFileURL(`${process.cwd()}/.test-build/local-changes.mjs`).href}?${Date.now()}`);
+const execFileAsync = promisify(execFile);
 
 test('lists every local file change without contacting a remote', async () => {
 	const calls = [];
@@ -146,6 +151,39 @@ test('groups the visible list by folder and gives every state human copy', () =>
 		detail: 'Edited on this computer',
 		icon: 'file-pen-line',
 	});
-	assert.equal(changes.describeLocalChange(parsed[2]).label, 'New file');
-	assert.equal(changes.describeLocalChange(parsed[3]).label, 'Deleted');
+	assert.equal(changes.describeLocalChange(parsed.find((change) => change.state === 'added')).label, 'New file');
+	assert.equal(changes.describeLocalChange(parsed.find((change) => change.state === 'deleted')).label, 'Deleted');
+});
+
+test('real Git reverts only the selected files, including an unstaged rename', async (t) => {
+	const directory = await mkdtemp(join(tmpdir(), 'local-changes-'));
+	t.after(() => rm(directory, { recursive: true, force: true }));
+	const run = async (args) => (await execFileAsync('git', args, {
+		cwd: directory,
+		encoding: 'utf8',
+		env: { ...process.env, GIT_NO_LAZY_FETCH: '1', GIT_LITERAL_PATHSPECS: '1' },
+	})).stdout;
+	await run(['init', '-b', 'main']);
+	await run(['config', 'user.name', 'Changes Test']);
+	await run(['config', 'user.email', 'changes@example.com']);
+	await writeFile(join(directory, 'Plan.md'), 'Original plan\n');
+	await writeFile(join(directory, 'Old.md'), 'Original name\n');
+	await run(['add', '-A']);
+	await run(['commit', '-m', 'Initial docs']);
+
+	await writeFile(join(directory, 'Plan.md'), 'Edited plan\n');
+	await rename(join(directory, 'Old.md'), join(directory, 'New.md'));
+	await writeFile(join(directory, 'Scratch.md'), 'Temporary\n');
+	const service = new changes.LocalChangesService({ raw: run });
+	const snapshot = await service.load({ 'New.md': 'Old.md' });
+	const byPath = new Map(snapshot.changes.map((change) => [change.path, change]));
+	assert.deepEqual(Array.from(byPath.keys()), ['New.md', 'Plan.md', 'Scratch.md']);
+
+	await changes.applyLocalRevert(byPath.get('Plan.md'), { raw: run }, async (path) => unlink(join(directory, path)));
+	assert.equal(await readFile(join(directory, 'Plan.md'), 'utf8'), 'Original plan\n');
+	assert.equal(await readFile(join(directory, 'Scratch.md'), 'utf8'), 'Temporary\n');
+	await changes.applyLocalRevert(byPath.get('New.md'), { raw: run }, async (path) => unlink(join(directory, path)));
+	assert.equal(await readFile(join(directory, 'Old.md'), 'utf8'), 'Original name\n');
+	await changes.applyLocalRevert(byPath.get('Scratch.md'), { raw: run }, async (path) => unlink(join(directory, path)));
+	assert.equal((await run(['status', '--porcelain'])).trim(), '');
 });
